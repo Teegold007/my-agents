@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 import anthropic
-from openai import OpenAI, BadRequestError, RateLimitError, APIConnectionError
+from openai import AsyncOpenAI, BadRequestError, RateLimitError, APIConnectionError
 from telegram import Update
 from telegram.ext import (
     Application, MessageHandler, CommandHandler,
@@ -65,8 +65,9 @@ except PermissionError:
 # ── Models ────────────────────────────────────────────────────────────────────
 
 MODELS = {
-    "claude":   {"provider": "anthropic",  "id": "claude-opus-4-5",                   "label": "Claude Opus 4.5",           "supports_tools": True},
+    "haiku":    {"provider": "anthropic",  "id": "claude-haiku-4-5-20251001",         "label": "Claude Haiku 4.5 (fast)",   "supports_tools": True},
     "sonnet":   {"provider": "anthropic",  "id": "claude-sonnet-4-6",                 "label": "Claude Sonnet 4.6",         "supports_tools": True},
+    "claude":   {"provider": "anthropic",  "id": "claude-opus-4-5",                   "label": "Claude Opus 4.5",           "supports_tools": True},
     "llama":    {"provider": "groq",       "id": "llama-3.3-70b-versatile",           "label": "Llama 3.3 70B (free)",      "supports_tools": False},
     "deepseek": {"provider": "openrouter", "id": "deepseek/deepseek-chat",            "label": "DeepSeek V3",               "supports_tools": True},
     "qwen":     {"provider": "openrouter", "id": "qwen/qwen-2.5-coder-32b-instruct", "label": "Qwen 2.5 Coder",            "supports_tools": True},
@@ -74,8 +75,9 @@ MODELS = {
 }
 
 FALLBACK_MODELS = {
-    "llama":    "qwen",
-    "qwen":     "deepseek",
+    "haiku":    "sonnet",
+    "llama":    "haiku",
+    "qwen":     "haiku",
     "deepseek": "sonnet",
     "r1":       "sonnet",
 }
@@ -442,7 +444,7 @@ async def start_task(
     # Resolve model
     if model_key == "auto":
         complexity = detect_complexity(task)
-        model_key  = "r1" if complexity == "complex" else "qwen"
+        model_key  = "sonnet" if complexity == "complex" else "haiku"
         await update.message.reply_html(
             f"🎯 Auto-selected <b>{model_key}</b> ({complexity} task)"
         )
