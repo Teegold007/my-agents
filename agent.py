@@ -59,12 +59,12 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 # ── Models ────────────────────────────────────────────────────────────────────
 
 MODELS = {
-    "claude":   {"provider": "anthropic",  "id": "claude-opus-4-5",                   "label": "Claude Opus 4.5"},
-    "sonnet":   {"provider": "anthropic",  "id": "claude-sonnet-4-6",                 "label": "Claude Sonnet 4.6"},
-    "llama":    {"provider": "groq",       "id": "llama-3.3-70b-versatile",           "label": "Llama 3.3 70B (free)"},
-    "deepseek": {"provider": "openrouter", "id": "deepseek/deepseek-chat",            "label": "DeepSeek V3"},
-    "qwen":     {"provider": "openrouter", "id": "qwen/qwen-2.5-coder-32b-instruct", "label": "Qwen 2.5 Coder"},
-    "r1":       {"provider": "openrouter", "id": "deepseek/deepseek-r1",             "label": "DeepSeek R1 (reasoning)"},
+    "claude":   {"provider": "anthropic",  "id": "claude-opus-4-5",                   "label": "Claude Opus 4.5",           "supports_tools": True},
+    "sonnet":   {"provider": "anthropic",  "id": "claude-sonnet-4-6",                 "label": "Claude Sonnet 4.6",         "supports_tools": True},
+    "llama":    {"provider": "groq",       "id": "llama-3.3-70b-versatile",           "label": "Llama 3.3 70B (free)",      "supports_tools": False},
+    "deepseek": {"provider": "openrouter", "id": "deepseek/deepseek-chat",            "label": "DeepSeek V3",               "supports_tools": True},
+    "qwen":     {"provider": "openrouter", "id": "qwen/qwen-2.5-coder-32b-instruct", "label": "Qwen 2.5 Coder",            "supports_tools": True},
+    "r1":       {"provider": "openrouter", "id": "deepseek/deepseek-r1",             "label": "DeepSeek R1 (reasoning)",   "supports_tools": False},
 }
 
 FALLBACK_MODELS = {
@@ -344,7 +344,7 @@ async def loop_openai_compat(job: Job, status_cb) -> str:
     cfg           = MODELS[job.model]
     client        = get_openai_client(cfg["provider"])
     cwd           = job.repo_path or WORKSPACE
-    tools_enabled = True
+    tools_enabled = cfg.get("supports_tools", True)
     messages      = [
         {"role": "system", "content": build_system_prompt(job)},
         {"role": "user",   "content": job.task},
