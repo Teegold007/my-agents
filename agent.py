@@ -35,6 +35,7 @@ from jobs import (
     Job, State,
     create_job, update_job, log_event, record_approval,
     get_job, get_active_job, get_recent_jobs, get_job_events,
+    get_interrupted_jobs,
 )
 from memory import build_memory_block, reflect_and_save, stats, clear, get_lessons, get_history
 
@@ -927,10 +928,46 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html("🔄 Restarting…")
     safe_run(["sudo", "systemctl", "restart", "agent"], cwd=AGENT_DIR)
 
+# ── Startup notification ──────────────────────────────────────────────────────
+
+async def on_startup(app: Application) -> None:
+    interrupted = get_interrupted_jobs()
+
+    # Mark any jobs that were mid-run as failed — they won't resume
+    for jobs in interrupted.values():
+        for job in jobs:
+            if job.status == State.RUNNING:
+                update_job(job.id, status=State.FAILED, result="Interrupted by restart.")
+                log_event(job.id, "interrupted", "agent restarted while job was running")
+
+    STATUS_LABELS = {
+        State.RUNNING:                "⚙️ was running (interrupted)",
+        State.PLANNED:                "📋 planned",
+        State.AWAITING_PLAN_APPROVAL: "⏳ awaiting plan approval — reply <b>approve {id}</b>",
+        State.AWAITING_DIFF_APPROVAL: "👀 awaiting diff approval — reply <b>approve {id}</b>",
+        State.NEW:                    "🆕 queued",
+    }
+
+    for uid in ALLOWED_USER_IDS:
+        lines = ["✅ <b>Agent is online and ready.</b>"]
+        pending = interrupted.get(uid, [])
+        if pending:
+            lines.append("")
+            lines.append("<b>Pending jobs from before restart:</b>")
+            for job in pending:
+                label = STATUS_LABELS.get(job.status, job.status)
+                label = label.format(id=job.id)
+                lines.append(f"• Job <code>#{job.id}</code> {label}")
+                lines.append(f"  <i>{esc(job.task[:80])}</i>")
+        try:
+            await app.bot.send_message(uid, "\n".join(lines), parse_mode="HTML")
+        except Exception:
+            pass
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(on_startup).build()
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("model",  cmd_model))
     app.add_handler(CommandHandler("jobs",   cmd_jobs))

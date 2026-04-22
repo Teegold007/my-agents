@@ -194,6 +194,22 @@ def get_recent_jobs(user_id: int, n: int = 5) -> list[Job]:
     return [_row_to_job(r) for r in rows]
 
 
+def get_interrupted_jobs() -> dict[int, list[Job]]:
+    """Return all non-terminal jobs grouped by user_id (survives restarts)."""
+    terminal = (State.COMMITTED, State.FAILED, State.CANCELLED)
+    placeholders = ",".join("?" * len(terminal))
+    with _db() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM jobs WHERE status NOT IN ({placeholders}) ORDER BY id",
+            terminal,
+        ).fetchall()
+    result: dict[int, list[Job]] = {}
+    for row in rows:
+        job = _row_to_job(row)
+        result.setdefault(job.user_id, []).append(job)
+    return result
+
+
 def get_job_events(job_id: int) -> list[dict]:
     with _db() as conn:
         rows = conn.execute(
