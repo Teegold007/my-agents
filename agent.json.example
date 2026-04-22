@@ -1,0 +1,5 @@
+{
+  "test_cmd": "npm test",
+  "lint_cmd": "npm run lint",
+  "protected_paths": ["src/config/production.json", ".env", "secrets/"]
+}
