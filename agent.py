@@ -57,7 +57,10 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 DEFAULT_MODEL      = os.getenv("DEFAULT_MODEL", "auto")
 
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
-Path(WORKSPACE).mkdir(parents=True, exist_ok=True)
+try:
+    Path(WORKSPACE).mkdir(parents=True, exist_ok=True)
+except PermissionError:
+    logging.warning(f"Cannot create WORKSPACE at {WORKSPACE!r} — check the path and permissions.")
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
