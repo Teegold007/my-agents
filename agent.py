@@ -14,6 +14,7 @@ Improvements over v1:
 
 import os
 import re
+import sys
 import json
 import logging
 import asyncio
@@ -56,6 +57,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 DEFAULT_MODEL      = os.getenv("DEFAULT_MODEL", "auto")
 
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+Path(WORKSPACE).mkdir(parents=True, exist_ok=True)
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
@@ -922,11 +924,16 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html("✅ Already on latest version.")
         return
 
+    # Install any new dependencies
     pip = str(Path(AGENT_DIR) / "venv" / "bin" / "pip")
     safe_run([pip, "install", "-r", str(Path(AGENT_DIR) / "requirements.txt"), "-q"],
              cwd=AGENT_DIR)
-    await update.message.reply_html("🔄 Restarting…")
-    safe_run(["sudo", "systemctl", "restart", "agent"], cwd=AGENT_DIR)
+
+    await update.message.reply_html("🔄 Restarting… I'll message you when I'm back.")
+
+    # Replace the current process with a fresh copy — no sudo/systemctl needed.
+    # systemd will restart the service if it's configured with Restart=always.
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 # ── Startup notification ──────────────────────────────────────────────────────
 

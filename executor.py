@@ -85,13 +85,21 @@ def safe_run(
         if SHELL_INJECTION_CHARS.search(str(arg)):
             raise ExecutionError(f"Suspicious argument blocked: {arg!r}")
 
-    # Verify the binary exists before trying to run it
-    if shutil.which(binary, path=_AUGMENTED_PATH) is None:
-        return -1, f"[binary not found: {binary} — is it installed?]"
-
-    # Pass the bare binary name — subprocess resolves it via PATH, avoiding
-    # broken-symlink issues (e.g. /usr/bin/git -> missing snap target)
-    argv = [binary] + list(argv[1:])
+    # Locate the binary and resolve any symlinks to confirm the target exists.
+    # shutil.which can return a broken symlink (e.g. /usr/bin/git -> /snap/bin/git
+    # when snap isn't mounted), so we verify the real path before using it.
+    found = shutil.which(binary, path=_AUGMENTED_PATH)
+    if found is None:
+        return -1, (
+            f"[{binary} not found in PATH — install it with: sudo apt install {binary}]"
+        )
+    real = os.path.realpath(found)
+    if not os.path.isfile(real):
+        return -1, (
+            f"[{binary} found at {found} but resolves to a missing target ({real}). "
+            f"Try: sudo apt install {binary}]"
+        )
+    argv = [real] + list(argv[1:])
 
     logger.info(f"safe_run: {' '.join(argv)} (cwd={cwd})")
 
@@ -106,8 +114,10 @@ def safe_run(
         )
     except subprocess.TimeoutExpired:
         return -1, f"[timeout after {timeout}s]"
-    except FileNotFoundError:
-        return -1, f"[binary not found: {argv[0]}]"
+    except FileNotFoundError as e:
+        if cwd and not os.path.isdir(cwd):
+            return -1, f"[working directory does not exist: {cwd}]"
+        return -1, f"[{argv[0]} not found — is it installed?]"
     except Exception as e:
         return -1, f"[error: {e}]"
 
