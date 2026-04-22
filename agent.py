@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 import anthropic
-from openai import OpenAI
+from openai import OpenAI, BadRequestError, RateLimitError, APIConnectionError
 from telegram import Update
 from telegram.ext import (
     Application, MessageHandler, CommandHandler,
@@ -65,6 +65,13 @@ MODELS = {
     "deepseek": {"provider": "openrouter", "id": "deepseek/deepseek-chat",            "label": "DeepSeek V3"},
     "qwen":     {"provider": "openrouter", "id": "qwen/qwen-2.5-coder-32b-instruct", "label": "Qwen 2.5 Coder"},
     "r1":       {"provider": "openrouter", "id": "deepseek/deepseek-r1",             "label": "DeepSeek R1 (reasoning)"},
+}
+
+FALLBACK_MODELS = {
+    "llama":    "qwen",
+    "qwen":     "deepseek",
+    "deepseek": "sonnet",
+    "r1":       "sonnet",
 }
 
 COMPLEX_KEYWORDS = {
@@ -334,20 +341,49 @@ async def loop_anthropic(job: Job, status_cb) -> str:
 
 
 async def loop_openai_compat(job: Job, status_cb) -> str:
-    cfg      = MODELS[job.model]
-    client   = get_openai_client(cfg["provider"])
-    cwd      = job.repo_path or WORKSPACE
-    messages = [
+    cfg           = MODELS[job.model]
+    client        = get_openai_client(cfg["provider"])
+    cwd           = job.repo_path or WORKSPACE
+    tools_enabled = True
+    messages      = [
         {"role": "system", "content": build_system_prompt(job)},
         {"role": "user",   "content": job.task},
     ]
 
     for step in range(30):
-        resp = client.chat.completions.create(
-            model=cfg["id"], max_tokens=8096,
-            tools=OPENAI_TOOLS, tool_choice="auto",
-            messages=messages,
-        )
+        # Build request kwargs — drop tools if the model proved it can't handle them
+        kwargs: dict = {"model": cfg["id"], "max_tokens": 8096, "messages": messages}
+        if tools_enabled:
+            kwargs["tools"]       = OPENAI_TOOLS
+            kwargs["tool_choice"] = "auto"
+
+        # Retry loop: handle rate-limits with backoff, bad tool-calls by disabling tools
+        for attempt in range(3):
+            try:
+                resp = client.chat.completions.create(**kwargs)
+                break
+            except RateLimitError:
+                if attempt < 2:
+                    wait = 5 * (2 ** attempt)   # 5s, 10s
+                    logger.warning(f"Rate-limited by {cfg['provider']}, retrying in {wait}s…")
+                    await asyncio.sleep(wait)
+                    continue
+                raise
+            except APIConnectionError:
+                if attempt < 2:
+                    await asyncio.sleep(3)
+                    continue
+                raise
+            except BadRequestError as e:
+                # Model generated a malformed tool call (e.g. name contains JSON)
+                if tools_enabled and "tool" in str(e).lower():
+                    logger.warning(f"Malformed tool call from {cfg['id']}, disabling tools: {e}")
+                    tools_enabled = False
+                    kwargs.pop("tools",       None)
+                    kwargs.pop("tool_choice", None)
+                    continue
+                raise
+
         msg = resp.choices[0].message
         messages.append(msg)
 
@@ -365,10 +401,27 @@ async def loop_openai_compat(job: Job, status_cb) -> str:
 
 
 async def run_agent(job: Job, status_cb) -> str:
-    provider = MODELS[job.model]["provider"]
-    if provider == "anthropic":
-        return await loop_anthropic(job, status_cb)
-    return await loop_openai_compat(job, status_cb)
+    async def _run(model_key: str) -> str:
+        provider = MODELS[model_key]["provider"]
+        if provider == "anthropic":
+            return await loop_anthropic(job, status_cb)
+        return await loop_openai_compat(job, status_cb)
+
+    try:
+        return await _run(job.model)
+    except Exception as e:
+        fallback = FALLBACK_MODELS.get(job.model)
+        if not fallback:
+            raise
+        logger.warning(f"Model {job.model} failed ({e}), falling back to {fallback}")
+        await status_cb(
+            f"⚠️ <i>{esc(MODELS[job.model]['label'])} failed — retrying with "
+            f"{esc(MODELS[fallback]['label'])}</i>"
+        )
+        update_job(job.id, model=fallback)
+        log_event(job.id, "model_fallback", f"{job.model} → {fallback}: {str(e)[:120]}")
+        job.model = fallback
+        return await _run(fallback)
 
 # ── Task pipeline ─────────────────────────────────────────────────────────────
 
@@ -383,7 +436,7 @@ async def start_task(
     # Resolve model
     if model_key == "auto":
         complexity = detect_complexity(task)
-        model_key  = "r1" if complexity == "complex" else "llama"
+        model_key  = "r1" if complexity == "complex" else "qwen"
         await update.message.reply_html(
             f"🎯 Auto-selected <b>{model_key}</b> ({complexity} task)"
         )
@@ -601,6 +654,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         await revert_job(update, job)
         return
+
+    # ── Clone shortcut — no LLM needed ───────────────────────────────────────
+    if re.search(r"\bclone\b", text, re.IGNORECASE):
+        m_url = re.search(
+            r"(https?://github\.com/[\w\-]+/[\w\-\.]+(?:\.git)?|[\w\-]+/[\w\-\.]+\.git|[\w\-]+/[\w\-]+)",
+            text,
+        )
+        if m_url:
+            ctx.args = [m_url.group(1)]
+            await cmd_clone(update, ctx)
+            return
 
     # ── New task ──────────────────────────────────────────────────────────────
     model_key = ctx.user_data.get("model", DEFAULT_MODEL)
