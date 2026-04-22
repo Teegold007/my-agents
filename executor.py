@@ -85,11 +85,13 @@ def safe_run(
         if SHELL_INJECTION_CHARS.search(str(arg)):
             raise ExecutionError(f"Suspicious argument blocked: {arg!r}")
 
-    # Resolve full path so the subprocess doesn't rely on a stripped service PATH
-    resolved_binary = shutil.which(binary, path=_AUGMENTED_PATH)
-    if resolved_binary is None:
+    # Verify the binary exists before trying to run it
+    if shutil.which(binary, path=_AUGMENTED_PATH) is None:
         return -1, f"[binary not found: {binary} — is it installed?]"
-    argv = [resolved_binary] + list(argv[1:])
+
+    # Pass the bare binary name — subprocess resolves it via PATH, avoiding
+    # broken-symlink issues (e.g. /usr/bin/git -> missing snap target)
+    argv = [binary] + list(argv[1:])
 
     logger.info(f"safe_run: {' '.join(argv)} (cwd={cwd})")
 
