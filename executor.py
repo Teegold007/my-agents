@@ -4,11 +4,26 @@ executor.py — safe command runner, no shell=True, allowlisted commands only.
 
 import os
 import re
+import shutil
 import subprocess
 import logging
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# ── PATH augmentation ─────────────────────────────────────────────────────────
+# System services often run with a stripped PATH. Combine the process PATH with
+# common install locations so binaries like git are always findable.
+
+_EXTRA_PATHS = [
+    "/usr/bin", "/usr/local/bin", "/bin",
+    "/usr/local/git/bin",          # macOS Xcode git
+    "/opt/homebrew/bin",           # Homebrew (Apple Silicon)
+    "/opt/homebrew/sbin",
+    "/home/linuxbrew/.linuxbrew/bin",  # Homebrew (Linux)
+    "/snap/bin",                   # Ubuntu snap packages
+]
+_AUGMENTED_PATH = ":".join(filter(None, [os.environ.get("PATH", "")] + _EXTRA_PATHS))
 
 # ── Allowlist ─────────────────────────────────────────────────────────────────
 # Only these top-level binaries may be executed.
@@ -70,6 +85,12 @@ def safe_run(
         if SHELL_INJECTION_CHARS.search(str(arg)):
             raise ExecutionError(f"Suspicious argument blocked: {arg!r}")
 
+    # Resolve full path so the subprocess doesn't rely on a stripped service PATH
+    resolved_binary = shutil.which(binary, path=_AUGMENTED_PATH)
+    if resolved_binary is None:
+        return -1, f"[binary not found: {binary} — is it installed?]"
+    argv = [resolved_binary] + list(argv[1:])
+
     logger.info(f"safe_run: {' '.join(argv)} (cwd={cwd})")
 
     try:
@@ -79,7 +100,7 @@ def safe_run(
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            env={**os.environ, "PATH": _AUGMENTED_PATH, "GIT_TERMINAL_PROMPT": "0"},
         )
     except subprocess.TimeoutExpired:
         return -1, f"[timeout after {timeout}s]"
