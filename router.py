@@ -38,41 +38,84 @@ Rules:
 - Keep conversational replies concise."""
 
 
-async def _dispatch(text: str, user_id: int) -> tuple[bool, str]:
-    """
-    Ask a fast LLM whether the message is a coding task or conversation.
-    Returns (is_task, chat_reply).
-    Falls back to treating the message as a task if the API call fails.
-    """
+# Regex heuristic for obvious non-task messages — used when all LLMs fail.
+_CONVO_RE = re.compile(
+    r"^(hi|hello|hey|thanks?|thank you|cheers|great|nice|awesome|good job|"
+    r"well done|perfect|ok|okay|cool|got it|sounds good|"
+    r"what did you (do|change|fix)|explain|why did|how does|what is|what's|"
+    r"who are you|can you help|help me understand)\b",
+    re.IGNORECASE,
+)
+
+
+def _build_dispatch_system() -> str:
+    from memory import get_user_preferences
+    prefs = get_user_preferences()
+    if prefs:
+        prefs_block = "\n".join(f"- {p}" for p in prefs)
+        return _DISPATCH_SYSTEM + f"\n\n## What you know about this user:\n{prefs_block}"
+    return _DISPATCH_SYSTEM
+
+
+async def _try_anthropic(system: str, messages: list) -> str | None:
     try:
         from llm import get_anthropic_client
-        from memory import get_user_preferences
-
-        client   = get_anthropic_client()
-        history  = convo_get(user_id)
-        messages = history + [{"role": "user", "content": text}]
-
-        prefs = get_user_preferences()
-        if prefs:
-            prefs_block = "\n".join(f"- {p}" for p in prefs)
-            system = _DISPATCH_SYSTEM + f"\n\n## What you know about this user:\n{prefs_block}"
-        else:
-            system = _DISPATCH_SYSTEM
-
+        client = get_anthropic_client()
         resp = await client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=512,
             system=system,
             messages=messages,
         )
-        reply = resp.content[0].text.strip()
-        if reply.upper() == "TASK":
-            return True, ""
-        return False, reply
-
+        return resp.content[0].text.strip()
     except Exception as e:
-        logger.warning(f"Dispatcher LLM failed ({e}), treating as task")
-        return True, ""
+        logger.warning(f"Anthropic dispatcher failed: {e}")
+        return None
+
+
+async def _try_groq(system: str, messages: list) -> str | None:
+    try:
+        from config import GROQ_API_KEY
+        from openai import AsyncOpenAI
+        if not GROQ_API_KEY:
+            return None
+        client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+        groq_messages = [{"role": "system", "content": system}] + messages
+        resp = await client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            max_tokens=512,
+            messages=groq_messages,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        logger.warning(f"Groq dispatcher failed: {e}")
+        return None
+
+
+async def _dispatch(text: str, user_id: int) -> tuple[bool, str]:
+    """
+    Ask a fast LLM whether the message is a coding task or conversation.
+    Returns (is_task, chat_reply).
+    Fallback chain: Anthropic haiku → Groq llama → regex heuristic → treat as task.
+    """
+    history  = convo_get(user_id)
+    messages = history + [{"role": "user", "content": text}]
+    system   = _build_dispatch_system()
+
+    for attempt in (_try_anthropic, _try_groq):
+        reply = await attempt(system, messages)
+        if reply is not None:
+            if reply.upper() == "TASK":
+                return True, ""
+            return False, reply
+
+    # Last resort: regex heuristic
+    if _CONVO_RE.match(text.strip()):
+        logger.info("Dispatcher: regex fallback → conversational")
+        return False, "I'm here! What would you like help with?"
+
+    logger.warning("All dispatchers failed — treating as task")
+    return True, ""
 
 
 # ── Message router ────────────────────────────────────────────────────────────
