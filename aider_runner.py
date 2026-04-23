@@ -112,6 +112,7 @@ async def _run_aider_once(model_str: str, job: Job, status_cb) -> tuple[str, int
         "--yes-always",
         "--no-pretty",
         "--no-fancy-input",
+        "--no-gitignore",   # don't touch .gitignore — we manage git ourselves
     ]
 
     log_event(job.id, "aider_start", f"model={model_str}")
@@ -152,7 +153,13 @@ async def _run_aider_once(model_str: str, job: Job, status_cb) -> tuple[str, int
 
                 # Kill as soon as the provider error line appears enough times —
                 # aider will just keep retrying otherwise.
-                if _is_provider_error(line) or _is_credit_error(line):
+                if _is_credit_error(line):
+                    error_count += 1
+                    if error_count >= _MAX_ERROR_REPEATS:
+                        killed_by = "credit exhausted"
+                        proc.kill()
+                        break
+                elif _is_provider_error(line):
                     error_count += 1
                     if error_count >= _MAX_ERROR_REPEATS:
                         killed_by = "provider error"
@@ -181,7 +188,8 @@ async def _run_aider_once(model_str: str, job: Job, status_cb) -> tuple[str, int
     if killed_by:
         lines.append(f"[aider killed: {killed_by}]")
 
-    return "\n".join(lines), proc.returncode if not killed_by else 1
+    rc = proc.returncode if not killed_by else 1
+    return "\n".join(lines), rc, killed_by
 
 
 async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
@@ -201,8 +209,8 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
             raise RuntimeError(f"All fallbacks exhausted. Last model: {model_key}")
         tried.add(model_key)
 
-        output, rc = await _run_aider_once(model_str, job, status_cb)
-        log_event(job.id, "aider_done", f"rc={rc} model={model_key}")
+        output, rc, killed_by = await _run_aider_once(model_str, job, status_cb)
+        log_event(job.id, "aider_done", f"rc={rc} killed_by={killed_by} model={model_key}")
 
         if rc == 0:
             return output, True
@@ -211,8 +219,8 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
         await status_cb(f"❌ <i>{esc(err_msg)}</i>")
         logger.warning(f"[job {job.id}] aider failed ({model_key}): {err_msg}")
 
-        # Detect credit exhaustion → switch to non-Anthropic fallback
-        if _is_credit_error(output) and MODELS.get(model_key, {}).get("provider") == "anthropic":
+        # Credit exhaustion — always escape to non-Anthropic model
+        if killed_by == "credit exhausted":
             fallback = CREDIT_FALLBACK
             await status_cb(
                 f"💳 <i>Anthropic credits exhausted — switching to "
@@ -224,8 +232,8 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
             model_key  = fallback
             continue
 
-        # Provider server error (500, bad gateway, no endpoints) → fallback
-        if _is_provider_error(output):
+        # Provider error — follow fallback chain
+        if killed_by == "provider error" or _is_provider_error(output):
             fallback = FALLBACK_MODELS.get(model_key) or (
                 CREDIT_FALLBACK if model_key != CREDIT_FALLBACK else None
             )
@@ -233,7 +241,7 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
                 await status_cb(
                     f"🔄 <i>Switching to {esc(MODELS[fallback]['label'])}…</i>"
                 )
-                log_event(job.id, "model_fallback", f"{model_key} → {fallback}: {err_msg}")
+                log_event(job.id, "model_fallback", f"{model_key} → {fallback}: {err_msg[:80]}")
                 update_job(job.id, model=fallback)
                 job.model = fallback
                 model_key  = fallback
