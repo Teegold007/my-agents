@@ -23,8 +23,12 @@ Rules:
 - For git tasks: always fetch the remote branch first, then use exact git commands
 - For "apply changes from branch X excluding file Y":
     1. git fetch origin <branch>
-    2. git diff HEAD origin/<branch> --name-only  (inspect what changed)
-    3. git checkout origin/<branch> -- <each desired file>  (skip excluded files)
+    2. git diff HEAD origin/<branch> --name-only   (discover which files actually changed)
+    3. For each changed file that is NOT excluded: git checkout origin/<branch> -- <exact-path>
+    The exact file paths are unknown until step 2 runs — so steps 3+ must say
+    "for each file returned by step 2 except <excluded>, run: git checkout origin/<branch> -- <file>"
+    Do NOT invent placeholder filenames like <each desired file> — that is not executable.
+- NEVER include git commit, git push, or git add steps — the orchestrator handles committing after user approval
 - Identify the exact files likely involved based on the task description
 - Minimum 4 steps, maximum 12
 - If feedback or a previous plan is provided, revise to address it — do NOT repeat the old plan
