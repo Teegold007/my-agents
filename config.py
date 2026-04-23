@@ -7,6 +7,7 @@ import os
 import re
 import json
 import logging
+import time
 from pathlib import Path
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -29,6 +30,42 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 DEFAULT_MODEL      = os.getenv("DEFAULT_MODEL", "deepseek")
 
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Groq rate-limit circuit breaker ──────────────────────────────────────────
+# When Groq's daily token limit is hit, all callers check this before attempting
+# a call. The backoff resets after _GROQ_BACKOFF_SECONDS.
+
+_GROQ_BACKOFF_UNTIL: float = 0.0
+_GROQ_BACKOFF_SECONDS = 3600  # 1 hour default; overridden by error message
+
+
+def groq_available() -> bool:
+    """Return False while Groq is in its rate-limit backoff window."""
+    return time.time() >= _GROQ_BACKOFF_UNTIL
+
+
+def groq_mark_rate_limited(retry_after_seconds: float = _GROQ_BACKOFF_SECONDS) -> None:
+    """Call this when a Groq RateLimitError is received."""
+    global _GROQ_BACKOFF_UNTIL
+    _GROQ_BACKOFF_UNTIL = time.time() + retry_after_seconds
+    logger.warning(
+        f"Groq rate-limited — disabling for {retry_after_seconds:.0f}s "
+        f"(until {datetime.fromtimestamp(_GROQ_BACKOFF_UNTIL).strftime('%H:%M:%S')})"
+    )
+
+
+def parse_groq_retry_after(error_message: str) -> float:
+    """Parse '1h44m30s' style retry-after from Groq error messages."""
+    m = re.search(r"try again in\s+((?:\d+h)?(?:\d+m)?(?:\d+(?:\.\d+)?s)?)", error_message, re.IGNORECASE)
+    if not m:
+        return _GROQ_BACKOFF_SECONDS
+    text = m.group(1)
+    seconds = 0.0
+    for value, unit in re.findall(r"(\d+(?:\.\d+)?)([hms])", text):
+        if unit == "h":   seconds += float(value) * 3600
+        elif unit == "m": seconds += float(value) * 60
+        else:             seconds += float(value)
+    return seconds if seconds > 0 else _GROQ_BACKOFF_SECONDS
 try:
     Path(WORKSPACE).mkdir(parents=True, exist_ok=True)
 except PermissionError:

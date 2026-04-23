@@ -48,11 +48,12 @@ JSON format:
 import logging
 logger = logging.getLogger(__name__)
 
-# Ordered preference for planning — most capable first, free fallback last.
+# Ordered preference for planning — most capable first.
+# Groq (llama) intentionally excluded: free-tier rate limits, weaker code planning.
 _PLAN_MODEL_CHAIN = [
-    ("anthropic", "claude-haiku-4-5-20251001"),
+    ("anthropic",  "claude-haiku-4-5-20251001"),
     ("openrouter", "deepseek/deepseek-chat"),
-    ("groq",       "llama-3.3-70b-versatile"),
+    ("openrouter", "qwen/qwen-2.5-coder-32b-instruct"),
 ]
 
 

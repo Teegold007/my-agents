@@ -56,9 +56,9 @@ async def _compact_history(user_id: int) -> None:
 async def _call_summary_llm(text: str) -> str:
     """Call Groq (free, fast) to summarise old conversation turns."""
     try:
-        from config import GROQ_API_KEY
-        from openai import AsyncOpenAI
-        if not GROQ_API_KEY:
+        from config import GROQ_API_KEY, groq_available, groq_mark_rate_limited, parse_groq_retry_after
+        from openai import AsyncOpenAI, RateLimitError
+        if not GROQ_API_KEY or not groq_available():
             return ""
         client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
         resp   = await client.chat.completions.create(
@@ -77,6 +77,11 @@ async def _call_summary_llm(text: str) -> str:
             ],
         )
         return resp.choices[0].message.content.strip()
+    except RateLimitError as e:
+        from config import groq_mark_rate_limited, parse_groq_retry_after
+        groq_mark_rate_limited(parse_groq_retry_after(str(e)))
+        logger.warning("Groq rate-limited — skipping history compaction")
+        return ""
     except Exception as e:
         logger.warning(f"History compaction failed: {e}")
         return ""

@@ -282,6 +282,10 @@ async def reflect_and_save(task: str, result: str, repo: str = None, model: str 
     if not GROQ_API_KEY:
         return
 
+    from config import groq_available, groq_mark_rate_limited, parse_groq_retry_after
+    if not groq_available():
+        return
+
     client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
     try:
         resp = client.chat.completions.create(
@@ -304,12 +308,20 @@ async def reflect_and_save(task: str, result: str, repo: str = None, model: str 
             save_lessons(data.get("repo_lessons", []), repo=detected_repo)
 
     except Exception as e:
+        err = str(e)
+        if "rate limit" in err.lower() or "ratelimit" in err.lower():
+            from config import groq_mark_rate_limited, parse_groq_retry_after
+            groq_mark_rate_limited(parse_groq_retry_after(err))
         logger.warning(f"Reflection failed: {e}")
 
 
 async def reflect_on_conversation(user_msg: str, assistant_reply: str):
     """Extract user preferences from a conversational exchange and save them."""
     if not GROQ_API_KEY:
+        return
+
+    from config import groq_available, groq_mark_rate_limited, parse_groq_retry_after
+    if not groq_available():
         return
 
     client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
@@ -328,4 +340,8 @@ async def reflect_on_conversation(user_msg: str, assistant_reply: str):
         data = json.loads(raw)
         save_user_preferences(data.get("preferences", []))
     except Exception as e:
+        err = str(e)
+        if "rate limit" in err.lower() or "ratelimit" in err.lower():
+            from config import groq_mark_rate_limited, parse_groq_retry_after
+            groq_mark_rate_limited(parse_groq_retry_after(err))
         logger.warning(f"Conversation reflection failed: {e}")

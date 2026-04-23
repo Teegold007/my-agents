@@ -81,9 +81,9 @@ async def _try_anthropic(system: str, messages: list) -> str | None:
 
 async def _try_groq(system: str, messages: list) -> str | None:
     try:
-        from config import GROQ_API_KEY
-        from openai import AsyncOpenAI
-        if not GROQ_API_KEY:
+        from config import GROQ_API_KEY, groq_available, groq_mark_rate_limited, parse_groq_retry_after
+        from openai import AsyncOpenAI, RateLimitError
+        if not GROQ_API_KEY or not groq_available():
             return None
         client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
         groq_messages = [{"role": "system", "content": system}] + messages
@@ -93,6 +93,11 @@ async def _try_groq(system: str, messages: list) -> str | None:
             messages=groq_messages,
         )
         return resp.choices[0].message.content.strip()
+    except RateLimitError as e:
+        from config import groq_mark_rate_limited, parse_groq_retry_after
+        groq_mark_rate_limited(parse_groq_retry_after(str(e)))
+        logger.warning(f"Groq rate-limited in dispatcher")
+        return None
     except Exception as e:
         logger.warning(f"Groq dispatcher failed: {e}")
         return None
