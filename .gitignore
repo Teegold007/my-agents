@@ -3,3 +3,4 @@ memory.db,
 venv,
 __pycache__
 .idea
+/.claude/
