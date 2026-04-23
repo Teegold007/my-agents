@@ -23,6 +23,13 @@ _EXTRA_PATHS = [
     "/home/linuxbrew/.linuxbrew/bin",  # Homebrew (Linux)
     "/snap/bin",                   # Ubuntu snap packages
 ]
+
+# Include the venv that the agent itself runs inside, so tools installed there
+# (e.g. aider) are always findable regardless of how the service was launched.
+_VENV_BIN = str(Path(__file__).parent / "venv" / "bin")
+if Path(_VENV_BIN).is_dir():
+    _EXTRA_PATHS.insert(0, _VENV_BIN)
+
 _AUGMENTED_PATH = ":".join(filter(None, [os.environ.get("PATH", "")] + _EXTRA_PATHS))
 
 # ── Allowlist ─────────────────────────────────────────────────────────────────

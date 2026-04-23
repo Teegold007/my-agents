@@ -19,6 +19,7 @@ from config import (
 )
 from conversation import convo_add, bg
 from llm import run_agent
+from aider_runner import aider_available, run_aider
 from planner import generate_plan, format_plan_html
 from executor import safe_run
 from jobs import (
@@ -94,10 +95,15 @@ async def execute_job(update: Update, job: Job) -> None:
         except Exception:
             pass
 
-    thinking = await update.message.reply_html("⏳ Working…")
+    if aider_available():
+        thinking = await update.message.reply_html("⏳ Working (aider)…")
+        _runner = run_aider
+    else:
+        thinking = await update.message.reply_html("⏳ Working…")
+        _runner = run_agent
 
     try:
-        result, tools_used = await run_agent(job, status_cb)
+        result, tools_used = await _runner(job, status_cb)
     except Exception as e:
         update_job(job.id, status=State.FAILED, result=str(e))
         log_event(job.id, "error", str(e))
