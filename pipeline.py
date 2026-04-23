@@ -63,6 +63,37 @@ def _is_git_task(job: Job) -> bool:
     return any(kw in task_lower for kw in git_keywords)
 
 
+def _inject_plan_steps(job: Job) -> Job:
+    """
+    Return a shallow copy of job with the task replaced by an execution-ready
+    message that includes the approved plan steps as explicit bash instructions.
+    Without this the agent just narrates what it would do instead of running commands.
+    """
+    import copy
+    if not job.plan:
+        return job
+
+    try:
+        plan  = json.loads(job.plan)
+        steps = plan.get("steps", [])
+        if not steps:
+            return job
+
+        numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
+        enriched = (
+            f"Task: {job.task}\n\n"
+            f"Execute these steps IN ORDER using the bash tool. "
+            f"Run each as a separate command — do NOT describe, actually run them:\n\n"
+            f"{numbered}\n\n"
+            f"After all steps complete, summarise what changed."
+        )
+        exec_job      = copy.copy(job)
+        exec_job.task = enriched
+        return exec_job
+    except Exception:
+        return job
+
+
 async def start_task(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -127,16 +158,20 @@ async def execute_job(update: Update, job: Job) -> None:
         except Exception:
             pass
 
-    if aider_available() and not _is_git_task(job):
+    # When a plan was approved, inject the steps as explicit instructions so the
+    # agent executes them rather than narrating what it would do.
+    exec_job = _inject_plan_steps(job)
+
+    if aider_available() and not _is_git_task(exec_job):
         thinking = await update.message.reply_html("⏳ Working (aider)…")
         _runner = run_aider
     else:
-        label   = "⏳ Working (git)…" if _is_git_task(job) else "⏳ Working…"
+        label   = "⏳ Working (git)…" if _is_git_task(exec_job) else "⏳ Working…"
         thinking = await update.message.reply_html(label)
         _runner = run_agent
 
     try:
-        result, tools_used = await _runner(job, status_cb)
+        result, tools_used = await _runner(exec_job, status_cb)
     except Exception as e:
         update_job(job.id, status=State.FAILED, result=str(e))
         log_event(job.id, "error", str(e))
