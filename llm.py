@@ -9,7 +9,7 @@ import logging
 import asyncio
 
 import anthropic
-from openai import AsyncOpenAI, BadRequestError, RateLimitError, APIConnectionError
+from openai import AsyncOpenAI, BadRequestError, NotFoundError, RateLimitError, APIConnectionError
 
 from config import (
     ANTHROPIC_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY,
@@ -284,18 +284,37 @@ async def loop_openai_compat(job: Job, status_cb) -> tuple[str, bool]:
 
 
 def _is_credit_error(e: Exception) -> bool:
-    """Return True when the Anthropic account has insufficient credits."""
     return "credit balance is too low" in str(e).lower()
+
+
+def _is_tool_error(e: Exception) -> bool:
+    """Return True for any error caused by the model not supporting tool/function calls."""
+    msg = str(e).lower()
+    return (
+        isinstance(e, NotFoundError) and "tool use" in msg
+    ) or (
+        isinstance(e, BadRequestError) and "tool" in msg
+    )
+
+
+def _best_tool_capable_fallback(current_key: str) -> str | None:
+    """Return the best available model that supports tools, excluding the current one."""
+    # Preference order: deepseek → sonnet → haiku
+    for candidate in ("deepseek", "sonnet", "haiku"):
+        if candidate != current_key and MODELS.get(candidate, {}).get("supports_tools"):
+            return candidate
+    return None
 
 
 async def run_agent(job: Job, status_cb) -> tuple[str, bool]:
     """Run the appropriate loop with automatic model fallback on failure.
 
-    Two fallback paths:
-    - Credit exhausted on Anthropic → CREDIT_FALLBACK (free Groq model)
-    - Any other failure → FALLBACK_MODELS chain
+    Fallback priority:
+    1. Tool-unsupported error (404/400 tool) → best tool-capable model
+    2. Anthropic credit exhaustion           → DeepSeek V3
+    3. Any other failure                     → FALLBACK_MODELS chain
     """
-    CREDIT_FALLBACK = "qwen"    # best free-tier coder (Qwen 2.5 Coder via OpenRouter)
+    CREDIT_FALLBACK = "deepseek"  # DeepSeek V3 via OpenRouter — supports tools, cheap
 
     async def _run(model_key: str) -> tuple[str, bool]:
         provider = MODELS[model_key]["provider"]
@@ -319,14 +338,22 @@ async def run_agent(job: Job, status_cb) -> tuple[str, bool]:
     except Exception as e:
         err_str = str(e)
 
-        # Anthropic credit exhaustion → free fallback regardless of normal chain
+        # Model doesn't support tool use → escalate to best tool-capable alternative
+        if _is_tool_error(e):
+            fallback = _best_tool_capable_fallback(job.model)
+            if fallback:
+                await status_cb(
+                    f"🔧 <i>{esc(MODELS[job.model]['label'])} doesn't support tool use "
+                    f"— switching to {esc(MODELS[fallback]['label'])}.</i>"
+                )
+                return await _switch(job.model, fallback, "tool use not supported")
+
+        # Anthropic credit exhaustion → DeepSeek
         if _is_credit_error(e) and MODELS[job.model]["provider"] == "anthropic":
-            await status_cb(
-                "💳 <i>Anthropic credits exhausted — switching to Qwen 2.5 Coder.</i>"
-            )
+            await status_cb("💳 <i>Anthropic credits exhausted — switching to DeepSeek V3.</i>")
             return await _switch(job.model, CREDIT_FALLBACK, "credit balance too low")
 
-        # Normal failure → follow FALLBACK_MODELS chain
+        # Any other failure → follow FALLBACK_MODELS chain
         fallback = FALLBACK_MODELS.get(job.model)
         if not fallback:
             raise

@@ -26,7 +26,7 @@ LOGS_DIR           = Path(os.environ.get("LOGS_DIR", "/home/agent3/runs"))
 ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-DEFAULT_MODEL      = os.getenv("DEFAULT_MODEL", "auto")
+DEFAULT_MODEL      = os.getenv("DEFAULT_MODEL", "deepseek")
 
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 try:
@@ -42,7 +42,7 @@ MODELS: dict[str, dict] = {
     "claude":   {"provider": "anthropic",  "id": "claude-opus-4-5",                   "label": "Claude Opus 4.5",          "supports_tools": True},
     "llama":    {"provider": "groq",       "id": "llama-3.3-70b-versatile",           "label": "Llama 3.3 70B (free)",     "supports_tools": False},
     "deepseek": {"provider": "openrouter", "id": "deepseek/deepseek-chat",            "label": "DeepSeek V3",              "supports_tools": True},
-    "qwen":     {"provider": "openrouter", "id": "qwen/qwen-2.5-coder-32b-instruct", "label": "Qwen 2.5 Coder",           "supports_tools": True},
+    "qwen":     {"provider": "openrouter", "id": "qwen/qwen-2.5-coder-32b-instruct", "label": "Qwen 2.5 Coder",           "supports_tools": False},
     "r1":       {"provider": "openrouter", "id": "deepseek/deepseek-r1",             "label": "DeepSeek R1 (reasoning)",  "supports_tools": False},
 }
 
