@@ -14,7 +14,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from config import DEFAULT_MODEL, MODELS, esc, send_html
-from conversation import get_queue
+from conversation import get_queue, convo_get, convo_add
 from executor import safe_run
 from jobs import State, get_job, get_active_job, update_job, log_event, record_approval
 from pipeline import execute_job, commit_job, revert_job, start_task
@@ -23,6 +23,59 @@ from commands import cmd_clone
 
 logger = logging.getLogger(__name__)
 
+# ── Conversational dispatcher ─────────────────────────────────────────────────
+
+_DISPATCH_SYSTEM = """You are a coding assistant embedded in a Telegram bot.
+Your job is to decide what the user wants and respond accordingly.
+
+Rules:
+- If the message is a CODING TASK (fix a bug, add a feature, refactor, write tests, etc.)
+  reply with exactly one word: TASK
+- If the message is conversational (greeting, thanks, a question about what was done,
+  asking for an explanation, asking about code concepts, general chat) — reply naturally
+  and helpfully. You have access to the recent conversation history for context.
+- Never say TASK for questions, greetings, or explanations — only for actual work requests.
+- Keep conversational replies concise."""
+
+
+async def _dispatch(text: str, user_id: int) -> tuple[bool, str]:
+    """
+    Ask a fast LLM whether the message is a coding task or conversation.
+    Returns (is_task, chat_reply).
+    Falls back to treating the message as a task if the API call fails.
+    """
+    try:
+        from llm import get_anthropic_client
+        from memory import get_user_preferences
+
+        client   = get_anthropic_client()
+        history  = convo_get(user_id)
+        messages = history + [{"role": "user", "content": text}]
+
+        prefs = get_user_preferences()
+        if prefs:
+            prefs_block = "\n".join(f"- {p}" for p in prefs)
+            system = _DISPATCH_SYSTEM + f"\n\n## What you know about this user:\n{prefs_block}"
+        else:
+            system = _DISPATCH_SYSTEM
+
+        resp = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            system=system,
+            messages=messages,
+        )
+        reply = resp.content[0].text.strip()
+        if reply.upper() == "TASK":
+            return True, ""
+        return False, reply
+
+    except Exception as e:
+        logger.warning(f"Dispatcher LLM failed ({e}), treating as task")
+        return True, ""
+
+
+# ── Message router ────────────────────────────────────────────────────────────
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     from config import auth
@@ -136,7 +189,21 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    # ── Start a new task ─────────────────────────────────────────────────────
+    # ── Dispatch: conversation or coding task? ────────────────────────────────
+    is_task, chat_reply = await _dispatch(text, user_id)
+
+    if not is_task:
+        # Store exchange in history so future turns have context
+        convo_add(user_id, "user",      text)
+        convo_add(user_id, "assistant", chat_reply)
+        await update.message.reply_html(send_html(esc(chat_reply)))
+        # Learn from this exchange in the background
+        from memory import reflect_on_conversation
+        from conversation import bg
+        bg(reflect_on_conversation(text, chat_reply))
+        return
+
+    # ── Start a new coding task ───────────────────────────────────────────────
     try:
         await start_task(update, ctx, text, model_key)
     except Exception as e:

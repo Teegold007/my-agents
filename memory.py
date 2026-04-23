@@ -215,6 +215,26 @@ def clear(repo: str = None, scope: str = "repo"):
             conn.execute("DELETE FROM lessons WHERE repo = ?", (repo,))
 
 
+# ── User preferences (stored as lessons with special repo scope) ───────────────
+
+_USER_SCOPE = "__user__"
+
+
+def save_user_preferences(preferences: list[str]):
+    """Save facts/preferences learned about the user from conversation."""
+    save_lessons(preferences, repo=_USER_SCOPE)
+
+
+def get_user_preferences() -> list[str]:
+    """Return stored facts and preferences about the user."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT lesson FROM lessons WHERE repo = ? ORDER BY hit_count DESC, id DESC LIMIT 30",
+            (_USER_SCOPE,),
+        ).fetchall()
+    return [r["lesson"] for r in rows]
+
+
 # ── Reflection ────────────────────────────────────────────────────────────────
 
 REFLECT_PROMPT = """\
@@ -236,6 +256,23 @@ Respond ONLY with valid JSON (no markdown, no extra text):
 }
 
 If there are no useful lessons, use empty arrays.
+"""
+
+CONVO_REFLECT_PROMPT = """\
+You are reviewing a conversation between a user and their AI assistant.
+Extract facts or preferences about the user worth remembering for future conversations.
+
+Focus on:
+- How the user likes to work or communicate
+- Their technical background, tools, or stack preferences
+- Goals, projects, or context they've shared
+- Things they explicitly said they like or dislike
+
+Skip anything obvious, generic, or already implied by the context.
+Return an empty array if nothing is worth remembering.
+
+Respond ONLY with valid JSON:
+{"preferences": ["fact 1", "fact 2"]}
 """
 
 
@@ -268,3 +305,27 @@ async def reflect_and_save(task: str, result: str, repo: str = None, model: str 
 
     except Exception as e:
         logger.warning(f"Reflection failed: {e}")
+
+
+async def reflect_on_conversation(user_msg: str, assistant_reply: str):
+    """Extract user preferences from a conversational exchange and save them."""
+    if not GROQ_API_KEY:
+        return
+
+    client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+    try:
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            max_tokens=256,
+            messages=[
+                {"role": "system", "content": CONVO_REFLECT_PROMPT},
+                {"role": "user",   "content": f"USER: {user_msg}\nASSISTANT: {assistant_reply}"},
+            ],
+        )
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$",          "", raw)
+        data = json.loads(raw)
+        save_user_preferences(data.get("preferences", []))
+    except Exception as e:
+        logger.warning(f"Conversation reflection failed: {e}")
