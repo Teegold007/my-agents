@@ -58,6 +58,76 @@ class ExecutionError(Exception):
     pass
 
 
+# ── Native file tools (no shell, no injection risk) ───────────────────────────
+
+_MAX_READ_BYTES  = 200_000   # ~5k lines
+_MAX_WRITE_BYTES = 500_000
+
+
+def tool_read_file(path: str, cwd: str) -> str:
+    """Read a file and return its content. Path is relative to cwd."""
+    target = Path(cwd, path).resolve()
+    cwd_r  = Path(cwd).resolve()
+    if not str(target).startswith(str(cwd_r)):
+        raise ExecutionError(f"Path traversal blocked: {path}")
+    if not target.exists():
+        raise ExecutionError(f"File not found: {path}")
+    if target.stat().st_size > _MAX_READ_BYTES:
+        raise ExecutionError(f"File too large to read in one call (>{_MAX_READ_BYTES} bytes): {path}")
+    return target.read_text(errors="replace")
+
+
+def tool_write_file(path: str, content: str, cwd: str) -> str:
+    """Write (overwrite) a file. Creates parent directories as needed."""
+    target = Path(cwd, path).resolve()
+    cwd_r  = Path(cwd).resolve()
+    if not str(target).startswith(str(cwd_r)):
+        raise ExecutionError(f"Path traversal blocked: {path}")
+    if len(content.encode()) > _MAX_WRITE_BYTES:
+        raise ExecutionError(f"Content too large to write (>{_MAX_WRITE_BYTES} bytes)")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content)
+    return f"Written {len(content)} chars to {path}"
+
+
+def tool_replace_in_file(path: str, old_str: str, new_str: str, cwd: str) -> str:
+    """
+    Replace the FIRST occurrence of old_str in the file with new_str.
+    Falls back to normalised-whitespace matching when exact match fails.
+    Returns a short diff summary on success.
+    """
+    target = Path(cwd, path).resolve()
+    cwd_r  = Path(cwd).resolve()
+    if not str(target).startswith(str(cwd_r)):
+        raise ExecutionError(f"Path traversal blocked: {path}")
+    if not target.exists():
+        raise ExecutionError(f"File not found: {path}")
+
+    original = target.read_text(errors="replace")
+
+    # Exact match
+    if old_str in original:
+        updated = original.replace(old_str, new_str, 1)
+        target.write_text(updated)
+        added   = len(new_str.splitlines())
+        removed = len(old_str.splitlines())
+        return f"Replaced in {path}: -{removed} lines +{added} lines"
+
+    # Normalised-whitespace fallback (handles minor indent/spacing diffs)
+    norm_orig = re.sub(r"[ \t]+", " ", original)
+    norm_old  = re.sub(r"[ \t]+", " ", old_str)
+    if norm_old in norm_orig:
+        idx     = norm_orig.index(norm_old)
+        updated = original[:idx] + new_str + original[idx + len(norm_old):]
+        target.write_text(updated)
+        return f"Replaced (normalised) in {path}"
+
+    raise ExecutionError(
+        f"old_str not found in {path}. "
+        f"Verify the exact text exists in the file first with read_file."
+    )
+
+
 def validate_path(path: str, workspace: str) -> str:
     """Ensure a path stays within the workspace. Raises on traversal."""
     resolved  = str(Path(workspace, path).resolve())

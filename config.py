@@ -96,14 +96,27 @@ def job_log_dir(job_id: int) -> Path:
 
 
 def load_repo_config(repo_path: str) -> dict:
-    """Load .agent.json from repo root if present."""
-    cfg_path = Path(repo_path) / ".agent.json"
-    if cfg_path.exists():
+    """Load .agent.json and AGENTS.md / AGENT.md from repo root if present."""
+    cfg: dict = {}
+
+    json_path = Path(repo_path) / ".agent.json"
+    if json_path.exists():
         try:
-            return json.loads(cfg_path.read_text())
+            cfg = json.loads(json_path.read_text())
         except Exception:
             pass
-    return {}
+
+    # Load AGENTS.md or AGENT.md (code_puppy convention) as free-form rules
+    for name in ("AGENTS.md", "AGENT.md", ".agent.md"):
+        md_path = Path(repo_path) / name
+        if md_path.exists():
+            try:
+                cfg["agents_md"] = md_path.read_text()[:4000]
+            except Exception:
+                pass
+            break
+
+    return cfg
 
 
 def auth(update) -> bool:

@@ -17,7 +17,10 @@ from config import (
     esc, job_log_dir, load_repo_config,
 )
 from conversation import convo_get, bg
-from executor import safe_run, parse_argv, ExecutionError
+from executor import (
+    safe_run, parse_argv, ExecutionError,
+    tool_read_file, tool_write_file, tool_replace_in_file,
+)
 from jobs import Job, update_job, log_event
 from memory import build_memory_block
 
@@ -45,39 +48,141 @@ _BASH_DESC = (
     "CWD defaults to the repo directory."
 )
 
-ANTHROPIC_TOOLS = [{
-    "name": "bash",
-    "description": _BASH_DESC,
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "command":     {"type": "string", "description": "Single command to run."},
-            "description": {"type": "string", "description": "One-line summary of what this does."},
-        },
-        "required": ["command", "description"],
-    },
-}]
-
-OPENAI_TOOLS = [{
-    "type": "function",
-    "function": {
+ANTHROPIC_TOOLS = [
+    {
         "name": "bash",
         "description": _BASH_DESC,
-        "parameters": {
+        "input_schema": {
             "type": "object",
             "properties": {
-                "command":     {"type": "string"},
-                "description": {"type": "string"},
+                "command":     {"type": "string", "description": "Single command to run."},
+                "description": {"type": "string", "description": "One-line summary of what this does."},
             },
             "required": ["command", "description"],
         },
     },
-}]
+    {
+        "name": "read_file",
+        "description": "Read the full content of a file. Use this before editing any file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path relative to repo root."},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "replace_in_file",
+        "description": (
+            "Replace the FIRST occurrence of old_str with new_str in a file. "
+            "PREFERRED over writing entire files — keeps diffs small. "
+            "Always read_file first to confirm the exact text to replace."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path":    {"type": "string", "description": "File path relative to repo root."},
+                "old_str": {"type": "string", "description": "Exact text to find (must exist in file)."},
+                "new_str": {"type": "string", "description": "Replacement text."},
+            },
+            "required": ["path", "old_str", "new_str"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": (
+            "Write (overwrite) a file with new content. "
+            "Only use when creating a new file or when a full rewrite is needed. "
+            "For existing files prefer replace_in_file."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path":    {"type": "string", "description": "File path relative to repo root."},
+                "content": {"type": "string", "description": "Full file content to write."},
+            },
+            "required": ["path", "content"],
+        },
+    },
+]
+
+_OPENAI_FILE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the full content of a file. Use this before editing any file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_in_file",
+            "description": (
+                "Replace the FIRST occurrence of old_str with new_str in a file. "
+                "PREFERRED over writing entire files — keeps diffs small. "
+                "Always read_file first to confirm the exact text to replace."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":    {"type": "string"},
+                    "old_str": {"type": "string"},
+                    "new_str": {"type": "string"},
+                },
+                "required": ["path", "old_str", "new_str"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Write (overwrite) a file with new content. "
+                "Only use when creating a new file or when a full rewrite is needed. "
+                "For existing files prefer replace_in_file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":    {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+]
+
+OPENAI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": _BASH_DESC,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command":     {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["command", "description"],
+            },
+        },
+    },
+] + _OPENAI_FILE_TOOLS
 
 # ── Safe bash wrapper for the agent loop ─────────────────────────────────────
 
 def agent_run(command_str: str, cwd: str, job_id: int, step: int) -> str:
-    """Parse and safely execute one LLM-generated command."""
+    """Parse and safely execute one bash command."""
     log_file = str(job_log_dir(job_id) / f"step_{step:03d}.log")
     try:
         argv = parse_argv(command_str)
@@ -87,6 +192,36 @@ def agent_run(command_str: str, cwd: str, job_id: int, step: int) -> str:
     except ExecutionError as e:
         log_event(job_id, "blocked", str(e))
         return f"[blocked] {e}"
+
+
+def execute_tool(name: str, inputs: dict, cwd: str, job_id: int, step: int) -> str:
+    """Dispatch a tool call by name to the appropriate handler."""
+    try:
+        if name == "bash":
+            return agent_run(inputs["command"], cwd, job_id, step)
+
+        if name == "read_file":
+            result = tool_read_file(inputs["path"], cwd)
+            log_event(job_id, "read_file", inputs["path"])
+            return result
+
+        if name == "write_file":
+            result = tool_write_file(inputs["path"], inputs["content"], cwd)
+            log_event(job_id, "write_file", inputs["path"])
+            return result
+
+        if name == "replace_in_file":
+            result = tool_replace_in_file(
+                inputs["path"], inputs["old_str"], inputs["new_str"], cwd
+            )
+            log_event(job_id, "replace_in_file", inputs["path"])
+            return result
+
+        return f"[unknown tool: {name}]"
+
+    except ExecutionError as e:
+        log_event(job_id, "tool_error", f"{name}: {e}")
+        return f"[error] {e}"
 
 # ── Skill blocks (distilled from superpowers.dev) ────────────────────────────
 
@@ -237,6 +372,8 @@ def build_system_prompt(job: Job) -> str:
     if cfg.get("lint_cmd"):  extras.append(f"Lint command: {cfg['lint_cmd']}")
     if cfg.get("protected_paths"):
         extras.append(f"NEVER modify: {', '.join(cfg['protected_paths'])}")
+    if cfg.get("agents_md"):
+        extras.append(f"Project rules (AGENTS.md):\n{cfg['agents_md']}")
 
     repo_note   = f"\nRepo: {job.repo} at {job.repo_path}" if job.repo else ""
     branch_note = f"\nBranch: {job.branch}" if job.branch else ""
@@ -244,19 +381,23 @@ def build_system_prompt(job: Job) -> str:
 
     base = f"""You are an expert coding agent on a Linux server.{repo_note}{branch_note}{extras_note}
 
+You MUST use tools to accomplish tasks — do NOT just describe or output code. Every action must be a tool call.
+
 Rules:
-- Run ONE simple command at a time — absolutely no shell operators: no &&, |, ;, $var, $(), loops, or redirects
-- To iterate over files: run the discovery command first, read its output, then call bash once per file
-- Only use allowed binaries: git, python, node, npm, pytest, ls, cat, find, grep, cp, mv, mkdir, etc.
-- Read files before editing them
+- ALWAYS call read_file before editing any file — never guess at content
+- PREFER replace_in_file over write_file — keep diffs small and targeted (100-300 lines max)
+- Use write_file only when creating new files or doing a complete rewrite
+- Run ONE simple bash command at a time — no &&, |, ;, $var, $(), loops, or redirects
+- To iterate over files: run the discovery command first, read output, then call bash/replace_in_file once per file
+- Only use allowed bash binaries: git, python, node, npm, pytest, ls, find, grep, cp, mv, mkdir, etc.
 - Check memory/lessons before starting — avoid known mistakes
 - DO NOT run git commit or git push — the orchestrator handles that after user approval
-- After making changes, summarise what you did
+- Continue autonomously — loop between reading, editing, and verifying until the task is complete
 
 End your response with:
 📝 Changes made
 📁 Files changed
-⚠️  Notes
+⚠️  Notes (assumptions made, risks, follow-up items)
 
 {_SKILL_SENIOR_ENGINEER}
 
@@ -298,9 +439,13 @@ async def loop_anthropic(job: Job, status_cb) -> tuple[str, bool]:
         messages.append({"role": "assistant", "content": resp.content})
         results = []
         for tu in tool_uses:
-            desc   = tu.input.get("description", tu.input["command"][:80])
-            await status_cb(f"⚙️ <i>{esc(desc)}</i>")
-            output = await asyncio.to_thread(agent_run, tu.input["command"], cwd, job.id, step)
+            desc = (
+                tu.input.get("description")
+                or tu.input.get("path")
+                or tu.input.get("command", "")[:80]
+            )
+            await status_cb(f"⚙️ <i>{esc(f'[{tu.name}] {desc}')}</i>")
+            output = await asyncio.to_thread(execute_tool, tu.name, tu.input, cwd, job.id, step)
             results.append({"type": "tool_result", "tool_use_id": tu.id, "content": output})
         messages.append({"role": "user", "content": results})
 
@@ -358,10 +503,15 @@ async def loop_openai_compat(job: Job, status_cb) -> tuple[str, bool]:
 
         tools_used = True
         for tc in msg.tool_calls:
-            args   = json.loads(tc.function.arguments)
-            desc   = args.get("description", args["command"][:80])
-            await status_cb(f"⚙️ <i>{esc(desc)}</i>")
-            output = await asyncio.to_thread(agent_run, args["command"], cwd, job.id, step)
+            args = json.loads(tc.function.arguments)
+            name = tc.function.name
+            desc = (
+                args.get("description")
+                or args.get("path")
+                or args.get("command", "")[:80]
+            )
+            await status_cb(f"⚙️ <i>{esc(f'[{name}] {desc}')}</i>")
+            output = await asyncio.to_thread(execute_tool, name, args, cwd, job.id, step)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
 
     return "⚠️ Hit 30-step limit.", tools_used
