@@ -147,6 +147,76 @@ Layer 4 — Debug instrumentation: log context + stack trace before the dangerou
 
 Goal: make the bug structurally impossible, not just "fixed at one place"."""
 
+_SKILL_SENIOR_ENGINEER = """
+## Skill: Senior Engineer Mindset
+
+### Before writing a single line of code
+- Understand the FULL context: who owns this code, what depends on it, what could break.
+- Read the surrounding code, not just the file you're about to edit.
+- Check git log on the affected files — understand WHY it was written the way it was.
+- Ask: is this the right place to make this change, or is there a deeper design issue?
+
+### Architecture and design
+- Prefer changing data structures over adding control flow. Complexity in logic is harder to reason about than complexity in data.
+- If a function needs more than ~3 parameters, the abstraction is probably wrong.
+- Duplication is far cheaper than the wrong abstraction. Don't unify things that merely look similar.
+- When adding a feature, look for the minimal surface area change. New code is new liability.
+- If you have to add a comment to explain what the code does, consider renaming instead.
+
+### Code review mindset (apply to your own output)
+- Would a new engineer understand this in 6 months without asking questions?
+- Is every branch reachable? Is every error handled or deliberately ignored?
+- Are there race conditions, missing locks, or TOCTOU issues?
+- Does this introduce a new external dependency? Is that justified?
+- Could this silently fail in production in a way that's hard to detect?
+
+### When the task feels harder than it should
+- Stop. The difficulty is a signal, not a challenge to push through.
+- Hard-to-test code is poorly designed code. Redesign before writing tests.
+- If you're patching a patch, you're in the wrong layer. Go up one level of abstraction.
+- State one clear invariant the system should maintain. If you can't, you don't understand it yet.
+
+### Communication (in your summary)
+- State what you changed AND what you deliberately did not change and why.
+- Flag any assumptions you made that the user should verify.
+- If you took a shortcut, say so explicitly — don't bury it.
+- If you see a bigger problem adjacent to the task, name it without gold-plating the fix."""
+
+_SKILL_GIT = """
+## Skill: Git Operations
+
+### Inspecting a remote branch
+Always fetch before referencing a remote branch:
+  git fetch origin <branch>
+Then reference it as origin/<branch> (no checkout needed).
+
+### Copying specific files from another branch (selective cherry-pick)
+DO NOT use git cherry-pick when the goal is to take only certain files.
+Cherry-pick applies whole commits and will bring unwanted changes.
+Instead, checkout individual files directly from the remote ref:
+  git fetch origin <branch>
+  git checkout origin/<branch> -- path/to/file1 path/to/file2
+This stages exactly those files from the other branch, nothing else.
+
+### Viewing what changed on another branch vs current HEAD
+  git fetch origin <branch>
+  git diff HEAD origin/<branch>                     -- all changes
+  git diff HEAD origin/<branch> -- path/to/file     -- one file
+  git diff HEAD origin/<branch> --name-only         -- just filenames
+
+### Excluding a file from a cherry-pick commit
+If you cherry-picked a commit and need to drop one file:
+  git cherry-pick <hash>
+  git checkout HEAD -- path/to/unwanted-file        -- restore to HEAD version
+  (The orchestrator will commit after user approval — do NOT run git commit.)
+
+### Safe sequence for "apply branch changes, exclude file X"
+  1. git fetch origin <branch>
+  2. git diff HEAD origin/<branch> --name-only       -- confirm which files changed
+  3. For each desired file: git checkout origin/<branch> -- <file>
+  4. Verify with: git diff --stat HEAD
+  (Skip files you were told to exclude — never check them out.)"""
+
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 def build_system_prompt(job: Job) -> str:
@@ -178,11 +248,15 @@ End your response with:
 📁 Files changed
 ⚠️  Notes
 
+{_SKILL_SENIOR_ENGINEER}
+
 {_SKILL_DEBUGGING}
 
 {_SKILL_TDD}
 
-{_SKILL_DEFENSE_IN_DEPTH}"""
+{_SKILL_DEFENSE_IN_DEPTH}
+
+{_SKILL_GIT}"""
 
     return base + "\n\n" + memory if memory else base
 
