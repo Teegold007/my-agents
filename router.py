@@ -17,7 +17,7 @@ from config import DEFAULT_MODEL, MODELS, esc, send_html
 from conversation import get_queue, convo_get, convo_add
 from executor import safe_run
 from jobs import State, get_job, get_active_job, update_job, log_event, record_approval
-from pipeline import execute_job, commit_job, revert_job, start_task
+from pipeline import execute_job, commit_job, revert_job, start_task, refine_job
 from planner import generate_plan, format_plan_html
 from commands import cmd_clone
 
@@ -205,10 +205,22 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             await cmd_clone(update, ctx)
             return
 
-    # ── Plan feedback — revise instead of queuing a new job ──────────────────
+    # ── Refinement — further instructions while awaiting diff approval ────────
     model_key = ctx.user_data.get("model", DEFAULT_MODEL)
     active    = get_active_job(user_id)
 
+    if active and active.status == State.AWAITING_DIFF_APPROVAL:
+        await update.message.reply_html(
+            f"🔧 Applying changes to job #{active.id}…"
+        )
+        try:
+            await refine_job(update, active, text)
+        except Exception as e:
+            logger.exception("Refinement error")
+            await update.message.reply_html(f"❌ Refinement failed: <code>{esc(str(e))}</code>")
+        return
+
+    # ── Plan feedback — revise instead of queuing a new job ──────────────────
     if active and active.status == State.AWAITING_PLAN_APPROVAL:
         cfg = MODELS[active.model]
         await update.message.reply_html("🔄 Revising plan…")
