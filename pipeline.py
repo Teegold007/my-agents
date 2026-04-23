@@ -162,6 +162,21 @@ async def execute_job(update: Update, job: Job) -> None:
     # agent executes them rather than narrating what it would do.
     exec_job = _inject_plan_steps(job)
 
+    # Git/shell tasks require tool calls. If the selected model doesn't support
+    # tools it will just narrate and nothing will execute — force a capable model.
+    if _is_git_task(exec_job) and not MODELS.get(exec_job.model, {}).get("supports_tools"):
+        capable = next(
+            (k for k in ("deepseek", "sonnet", "haiku") if MODELS.get(k, {}).get("supports_tools")),
+            None,
+        )
+        if capable:
+            await status_cb(
+                f"🔀 <i>{esc(MODELS[exec_job.model]['label'])} can't run commands — "
+                f"switching to {esc(MODELS[capable]['label'])} for this git task.</i>"
+            )
+            update_job(job.id, model=capable)
+            exec_job.model = capable
+
     if aider_available() and not _is_git_task(exec_job):
         thinking = await update.message.reply_html("⏳ Working (aider)…")
         _runner = run_aider

@@ -180,7 +180,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             record_approval(job_id, "plan", user_id)
             update_job(job_id, status=State.NEW)
             await update.message.reply_html(f"▶️ Approved plan. Executing job #{job_id}…")
-            await execute_job(update, get_job(job_id))
+            try:
+                await execute_job(update, get_job(job_id))
+            except Exception as e:
+                logger.exception(f"execute_job failed for job #{job_id}")
+                update_job(job_id, status=State.FAILED)
+                await update.message.reply_html(
+                    f"❌ Job #{job_id} crashed: <code>{esc(str(e))}</code>"
+                )
 
         elif job.status == State.AWAITING_DIFF_APPROVAL:
             await commit_job(update, job)
