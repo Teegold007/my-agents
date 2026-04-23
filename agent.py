@@ -144,15 +144,42 @@ def send_html(text: str) -> str:
 # ── API clients ───────────────────────────────────────────────────────────────
 
 def get_anthropic_client():
-    return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 
-def get_openai_client(provider: str) -> OpenAI:
+def get_openai_client(provider: str) -> AsyncOpenAI:
     if provider == "groq":
-        return OpenAI(api_key=GROQ_API_KEY,       base_url="https://api.groq.com/openai/v1")
+        return AsyncOpenAI(api_key=GROQ_API_KEY,       base_url="https://api.groq.com/openai/v1")
     if provider == "openrouter":
-        return OpenAI(api_key=OPENROUTER_API_KEY,  base_url="https://openrouter.ai/api/v1")
+        return AsyncOpenAI(api_key=OPENROUTER_API_KEY,  base_url="https://openrouter.ai/api/v1")
     raise ValueError(f"Unknown provider: {provider}")
+
+# ── Conversation history ──────────────────────────────────────────────────────
+
+_conversations: dict[int, list[dict]] = {}
+_MAX_HISTORY   = 20   # message turns to keep per user
+
+def convo_add(user_id: int, role: str, content: str) -> None:
+    hist = _conversations.setdefault(user_id, [])
+    hist.append({"role": role, "content": content})
+    if len(hist) > _MAX_HISTORY:
+        _conversations[user_id] = hist[-_MAX_HISTORY:]
+
+def convo_get(user_id: int) -> list[dict]:
+    return list(_conversations.get(user_id, []))
+
+def convo_clear(user_id: int) -> None:
+    _conversations.pop(user_id, None)
+
+# ── Background task registry (prevents GC of fire-and-forget tasks) ──────────
+
+_bg_tasks: set[asyncio.Task] = set()
+
+def bg(coro) -> asyncio.Task:
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+    return t
 
 # ── Tool definitions ──────────────────────────────────────────────────────────
 
@@ -317,13 +344,15 @@ def format_plan_html(plan: dict, job_id: int) -> str:
 
 # ── Agentic loops ─────────────────────────────────────────────────────────────
 
-async def loop_anthropic(job: Job, status_cb) -> str:
-    client   = get_anthropic_client()
-    messages = [{"role": "user", "content": job.task}]
-    cwd      = job.repo_path or WORKSPACE
+async def loop_anthropic(job: Job, status_cb) -> tuple[str, bool]:
+    client     = get_anthropic_client()
+    history    = convo_get(job.user_id)
+    messages   = history + [{"role": "user", "content": job.task}]
+    cwd        = job.repo_path or WORKSPACE
+    tools_used = False
 
     for step in range(30):
-        resp = client.messages.create(
+        resp = await client.messages.create(
             model=MODELS[job.model]["id"],
             max_tokens=8096,
             system=build_system_prompt(job),
@@ -334,45 +363,46 @@ async def loop_anthropic(job: Job, status_cb) -> str:
         text_blocks = [b for b in resp.content if b.type == "text"]
 
         if not tool_uses:
-            return "\n".join(b.text for b in text_blocks).strip() or "Done."
+            reply = "\n".join(b.text for b in text_blocks).strip() or "Done."
+            return reply, tools_used
 
+        tools_used = True
         messages.append({"role": "assistant", "content": resp.content})
         results = []
         for tu in tool_uses:
             desc   = tu.input.get("description", tu.input["command"][:80])
             await status_cb(f"⚙️ <i>{esc(desc)}</i>")
-            output = agent_run(tu.input["command"], cwd, job.id, step)
+            output = await asyncio.to_thread(agent_run, tu.input["command"], cwd, job.id, step)
             results.append({"type": "tool_result", "tool_use_id": tu.id, "content": output})
         messages.append({"role": "user", "content": results})
 
-    return "⚠️ Hit 30-step limit."
+    return "⚠️ Hit 30-step limit.", tools_used
 
 
-async def loop_openai_compat(job: Job, status_cb) -> str:
+async def loop_openai_compat(job: Job, status_cb) -> tuple[str, bool]:
     cfg           = MODELS[job.model]
     client        = get_openai_client(cfg["provider"])
     cwd           = job.repo_path or WORKSPACE
     tools_enabled = cfg.get("supports_tools", True)
-    messages      = [
-        {"role": "system", "content": build_system_prompt(job)},
-        {"role": "user",   "content": job.task},
-    ]
+    tools_used    = False
+    history       = convo_get(job.user_id)
+    messages      = [{"role": "system", "content": build_system_prompt(job)}] \
+                  + history \
+                  + [{"role": "user", "content": job.task}]
 
     for step in range(30):
-        # Build request kwargs — drop tools if the model proved it can't handle them
         kwargs: dict = {"model": cfg["id"], "max_tokens": 8096, "messages": messages}
         if tools_enabled:
             kwargs["tools"]       = OPENAI_TOOLS
             kwargs["tool_choice"] = "auto"
 
-        # Retry loop: handle rate-limits with backoff, bad tool-calls by disabling tools
         for attempt in range(3):
             try:
-                resp = client.chat.completions.create(**kwargs)
+                resp = await client.chat.completions.create(**kwargs)
                 break
             except RateLimitError:
                 if attempt < 2:
-                    wait = 5 * (2 ** attempt)   # 5s, 10s
+                    wait = 5 * (2 ** attempt)
                     logger.warning(f"Rate-limited by {cfg['provider']}, retrying in {wait}s…")
                     await asyncio.sleep(wait)
                     continue
@@ -383,7 +413,6 @@ async def loop_openai_compat(job: Job, status_cb) -> str:
                     continue
                 raise
             except BadRequestError as e:
-                # Model generated a malformed tool call (e.g. name contains JSON)
                 if tools_enabled and "tool" in str(e).lower():
                     logger.warning(f"Malformed tool call from {cfg['id']}, disabling tools: {e}")
                     tools_enabled = False
@@ -396,20 +425,21 @@ async def loop_openai_compat(job: Job, status_cb) -> str:
         messages.append(msg)
 
         if not msg.tool_calls:
-            return (msg.content or "Done.").strip()
+            return (msg.content or "Done.").strip(), tools_used
 
+        tools_used = True
         for tc in msg.tool_calls:
             args   = json.loads(tc.function.arguments)
             desc   = args.get("description", args["command"][:80])
             await status_cb(f"⚙️ <i>{esc(desc)}</i>")
-            output = agent_run(args["command"], cwd, job.id, step)
+            output = await asyncio.to_thread(agent_run, args["command"], cwd, job.id, step)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": output})
 
-    return "⚠️ Hit 30-step limit."
+    return "⚠️ Hit 30-step limit.", tools_used
 
 
-async def run_agent(job: Job, status_cb) -> str:
-    async def _run(model_key: str) -> str:
+async def run_agent(job: Job, status_cb) -> tuple[str, bool]:
+    async def _run(model_key: str) -> tuple[str, bool]:
         provider = MODELS[model_key]["provider"]
         if provider == "anthropic":
             return await loop_anthropic(job, status_cb)
@@ -503,7 +533,7 @@ async def execute_job(update: Update, job: Job):
     thinking = await update.message.reply_html("⏳ Working…")
 
     try:
-        result = await run_agent(job, status_cb)
+        result, tools_used = await run_agent(job, status_cb)
     except Exception as e:
         update_job(job.id, status=State.FAILED, result=str(e))
         log_event(job.id, "error", str(e))
@@ -515,19 +545,22 @@ async def execute_job(update: Update, job: Job):
     update_job(job.id, result=result[:2000])
     log_event(job.id, "execution_done", result[:200])
 
+    # Update conversation history so follow-ups have context
+    convo_add(job.user_id, "user",      job.task)
+    convo_add(job.user_id, "assistant", result)
+
     # Show result summary
     await update.message.reply_html(send_html(esc(result)))
 
     # Show diff and wait for commit approval
     if is_git:
-        rc, diff_stat = safe_run(["git", "diff", "--stat", "HEAD"], cwd=repo_path)
-        rc, diff_full = safe_run(["git", "diff", "HEAD"],           cwd=repo_path)
-        rc, untracked = safe_run(["git", "status", "--short"],      cwd=repo_path)
+        _, diff_stat = safe_run(["git", "diff", "--stat", "HEAD"], cwd=repo_path)
+        _, diff_full = safe_run(["git", "diff", "HEAD"],           cwd=repo_path)
+        _, untracked = safe_run(["git", "status", "--short"],      cwd=repo_path)
 
         has_changes = diff_stat.strip() or untracked.strip()
 
         if has_changes:
-            # Save full diff to disk
             diff_file = job_log_dir(job.id) / "diff.txt"
             diff_file.write_text(diff_full)
 
@@ -543,8 +576,19 @@ async def execute_job(update: Update, job: Job):
             )
             return
 
-    # No changes — finish
-    await finish_job(update, job.id)
+        # Agent ran but produced no file changes
+        if tools_used:
+            await update.message.reply_html(
+                "⚠️ The agent ran commands but made no file changes. "
+                "Try being more specific about what to change, or check if the repo path is correct."
+            )
+        else:
+            await update.message.reply_html(
+                "⚠️ The agent gave a response without running any commands — "
+                "this is likely a hallucination. Please rephrase your task."
+            )
+
+    await finish_job(job.id)
 
 
 async def commit_job(update: Update, job: Job):
@@ -565,15 +609,13 @@ async def commit_job(update: Update, job: Job):
     log_event(job.id, "committed", commit_hash)
     record_approval(job.id, "commit", update.effective_user.id)
 
-    asyncio.create_task(
-        reflect_and_save(job.task, job.result or "", repo=job.repo, model=job.model)
-    )
+    bg(reflect_and_save(job.task, job.result or "", repo=job.repo, model=job.model))
 
     await update.message.reply_html(
         f"✅ <b>Job #{job.id} committed</b>\n"
         f"Branch: <code>{esc(job.branch or 'unknown')}</code>\n"
         f"Commit: <code>{esc(commit_hash)}</code>\n\n"
-        f"Merge whenever you're ready."
+        f"Reply <b>push {job.id}</b> to push the branch, or merge manually."
     )
 
 
@@ -595,13 +637,11 @@ async def revert_job(update: Update, job: Job):
     )
 
 
-async def finish_job(update: Update, job_id: int):
+def finish_job(job_id: int) -> None:
     job = get_job(job_id)
     update_job(job_id, status=State.COMMITTED)
     log_event(job_id, "finished")
-    asyncio.create_task(
-        reflect_and_save(job.task, job.result or "", repo=job.repo, model=job.model)
-    )
+    bg(reflect_and_save(job.task, job.result or "", repo=job.repo, model=job.model))
 
 # ── Queue ─────────────────────────────────────────────────────────────────────
 
@@ -648,6 +688,29 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_html(
                 f"Job #{job_id} is in state <code>{esc(job.status)}</code> — nothing to approve."
             )
+        return
+
+    # ── push <job_id> ─────────────────────────────────────────────────────────
+    m = re.match(r"^push\s+(\d+)$", text, re.IGNORECASE)
+    if m:
+        job_id = int(m.group(1))
+        job    = get_job(job_id)
+        if not job or job.user_id != user_id:
+            await update.message.reply_html("❌ Job not found.")
+            return
+        if job.status != State.COMMITTED or not job.branch:
+            await update.message.reply_html(
+                f"Job #{job_id} is in state <code>{esc(job.status)}</code> — nothing to push."
+            )
+            return
+        rc, out = safe_run(["git", "push", "-u", "origin", job.branch], cwd=job.repo_path)
+        if rc == 0:
+            log_event(job_id, "pushed", job.branch)
+            await update.message.reply_html(
+                f"🚀 Pushed <code>{esc(job.branch)}</code> to origin."
+            )
+        else:
+            await update.message.reply_html(f"❌ Push failed:\n<pre>{esc(out[:500])}</pre>")
         return
 
     # ── revert <job_id> ───────────────────────────────────────────────────────
@@ -710,9 +773,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• /cancel &lt;job_id&gt; — cancel a job\n"
         "• /memory — lessons learned\n"
         "• /forget &lt;repo|global&gt; — clear memory\n"
+        "• /new — reset conversation context\n"
         "• /update — pull latest agent code &amp; restart\n\n"
-        "<b>Approvals:</b>\n"
+        "<b>Approvals &amp; actions:</b>\n"
         "• <code>approve &lt;job_id&gt;</code> — approve plan or commit\n"
+        "• <code>push &lt;job_id&gt;</code> — push branch to origin\n"
         "• <code>revert &lt;job_id&gt;</code> — undo changes\n\n"
         "Just send any task in plain English!"
     )
@@ -900,6 +965,12 @@ async def cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html("\n".join(lines))
 
 
+async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not auth(update): return
+    convo_clear(update.effective_user.id)
+    await update.message.reply_html("🆕 Conversation reset. Starting fresh!")
+
+
 async def cmd_forget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not auth(update): return
     if not ctx.args:
@@ -989,6 +1060,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("forget", cmd_forget))
+    app.add_handler(CommandHandler("new",    cmd_new))
     app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Agent v2 started.")
