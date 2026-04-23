@@ -152,6 +152,71 @@ async def execute_job(update: Update, job: Job) -> None:
     finish_job(job.id)
 
 
+async def refine_job(update: Update, job: Job, instruction: str) -> None:
+    """Apply further instructions to an already-executed job (on its branch)."""
+    repo_path = job.repo_path
+
+    # Temporarily put the job back in RUNNING so get_active_job blocks new tasks
+    update_job(job.id, status=State.RUNNING, task=f"{job.task}\n\nRefinement: {instruction}")
+    log_event(job.id, "refinement_started", instruction[:200])
+
+    async def status_cb(msg: str) -> None:
+        try:
+            await update.message.reply_html(send_html(msg))
+        except Exception:
+            pass
+
+    # Swap the job task for the instruction so the agent only sees what to change
+    refined_job        = get_job(job.id)
+    original_task      = refined_job.task
+    refined_job.task   = instruction
+
+    if aider_available():
+        thinking = await update.message.reply_html("⏳ Refining (aider)…")
+        _runner = run_aider
+    else:
+        thinking = await update.message.reply_html("⏳ Refining…")
+        _runner = run_agent
+
+    try:
+        result, _ = await _runner(refined_job, status_cb)
+    except Exception as e:
+        update_job(job.id, status=State.AWAITING_DIFF_APPROVAL, task=original_task, result=str(e))
+        log_event(job.id, "refinement_error", str(e))
+        await thinking.delete()
+        await update.message.reply_html(f"❌ Refinement failed: <code>{esc(str(e))}</code>")
+        return
+
+    await thinking.delete()
+    update_job(job.id, result=result[:2000])
+    log_event(job.id, "refinement_done", result[:200])
+    convo_add(job.user_id, "user",      instruction)
+    convo_add(job.user_id, "assistant", result)
+    await update.message.reply_html(send_html(esc(result)))
+
+    # Show updated diff
+    _, diff_stat = safe_run(["git", "diff", "--stat", "HEAD"], cwd=repo_path)
+    _, diff_full = safe_run(["git", "diff", "HEAD"],           cwd=repo_path)
+    _, untracked = safe_run(["git", "status", "--short"],      cwd=repo_path)
+
+    if diff_stat.strip() or untracked.strip():
+        (job_log_dir(job.id) / "diff.txt").write_text(diff_full)
+        preview = diff_stat[:1500] if diff_stat.strip() else untracked[:1500]
+        update_job(job.id, status=State.AWAITING_DIFF_APPROVAL)
+        log_event(job.id, "awaiting_diff_approval")
+        await update.message.reply_html(
+            f"<b>📋 Updated Diff — Job #{job.id}</b>\n"
+            f"<pre>{esc(preview)}</pre>\n\n"
+            f"Reply <b>approve {job.id}</b> to commit, <b>revert {job.id}</b> to undo, "
+            f"or keep giving instructions."
+        )
+    else:
+        update_job(job.id, status=State.AWAITING_DIFF_APPROVAL)
+        await update.message.reply_html(
+            "⚠️ No file changes detected after refinement. Try a more specific instruction."
+        )
+
+
 async def commit_job(update: Update, job: Job) -> None:
     """Commit approved changes and notify the user."""
     import re
