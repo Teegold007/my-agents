@@ -283,26 +283,51 @@ async def loop_openai_compat(job: Job, status_cb) -> tuple[str, bool]:
     return "⚠️ Hit 30-step limit.", tools_used
 
 
+def _is_credit_error(e: Exception) -> bool:
+    """Return True when the Anthropic account has insufficient credits."""
+    return "credit balance is too low" in str(e).lower()
+
+
 async def run_agent(job: Job, status_cb) -> tuple[str, bool]:
-    """Run the appropriate loop with automatic model fallback on failure."""
+    """Run the appropriate loop with automatic model fallback on failure.
+
+    Two fallback paths:
+    - Credit exhausted on Anthropic → CREDIT_FALLBACK (free Groq model)
+    - Any other failure → FALLBACK_MODELS chain
+    """
+    CREDIT_FALLBACK = "qwen"    # best free-tier coder (Qwen 2.5 Coder via OpenRouter)
+
     async def _run(model_key: str) -> tuple[str, bool]:
         provider = MODELS[model_key]["provider"]
         if provider == "anthropic":
             return await loop_anthropic(job, status_cb)
         return await loop_openai_compat(job, status_cb)
 
+    async def _switch(from_key: str, to_key: str, reason: str) -> tuple[str, bool]:
+        logger.warning(f"Model {from_key} failed ({reason}), falling back to {to_key}")
+        await status_cb(
+            f"⚠️ <i>{esc(MODELS[from_key]['label'])} unavailable — retrying with "
+            f"{esc(MODELS[to_key]['label'])}</i>"
+        )
+        update_job(job.id, model=to_key)
+        log_event(job.id, "model_fallback", f"{from_key} → {to_key}: {reason[:120]}")
+        job.model = to_key
+        return await _run(to_key)
+
     try:
         return await _run(job.model)
     except Exception as e:
+        err_str = str(e)
+
+        # Anthropic credit exhaustion → free fallback regardless of normal chain
+        if _is_credit_error(e) and MODELS[job.model]["provider"] == "anthropic":
+            await status_cb(
+                "💳 <i>Anthropic credits exhausted — switching to Qwen 2.5 Coder.</i>"
+            )
+            return await _switch(job.model, CREDIT_FALLBACK, "credit balance too low")
+
+        # Normal failure → follow FALLBACK_MODELS chain
         fallback = FALLBACK_MODELS.get(job.model)
         if not fallback:
             raise
-        logger.warning(f"Model {job.model} failed ({e}), falling back to {fallback}")
-        await status_cb(
-            f"⚠️ <i>{esc(MODELS[job.model]['label'])} failed — retrying with "
-            f"{esc(MODELS[fallback]['label'])}</i>"
-        )
-        update_job(job.id, model=fallback)
-        log_event(job.id, "model_fallback", f"{job.model} → {fallback}: {str(e)[:120]}")
-        job.model = fallback
-        return await _run(fallback)
+        return await _switch(job.model, fallback, err_str)
