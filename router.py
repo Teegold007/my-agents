@@ -16,7 +16,7 @@ from telegram.ext import ContextTypes
 from config import DEFAULT_MODEL, MODELS, esc, send_html
 from conversation import get_queue, convo_get, convo_add
 from executor import safe_run
-from jobs import State, get_job, get_active_job, update_job, log_event, record_approval
+from jobs import State, get_job, get_active_job, update_job, log_event, record_approval, get_job_events
 from pipeline import execute_job, commit_job, revert_job, start_task, refine_job
 from planner import generate_plan, format_plan_html
 from commands import cmd_clone
@@ -127,6 +127,44 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     text    = update.message.text.strip()
     user_id = update.effective_user.id
+
+    # ── status [job_id] — works even while a job is running ──────────────────
+    m = re.match(r"^status(?:\s+(\d+))?$", text, re.IGNORECASE)
+    if m:
+        job_id = int(m.group(1)) if m.group(1) else None
+        job    = get_job(job_id) if job_id else get_active_job(user_id)
+        if not job or (job_id and job.user_id != user_id):
+            await update.message.reply_html("No active job found.")
+            return
+        events = get_job_events(job.id)
+        recent = "\n".join(
+            f"• [{e['created_at'][11:19]}] {e['type']}: {(e['message'] or '')[:80]}"
+            for e in events[-6:]
+        )
+        await update.message.reply_html(
+            f"<b>Job #{job.id}</b> — <code>{esc(job.status)}</code>\n"
+            f"Model: {esc(job.model)}  Branch: <code>{esc(job.branch or '—')}</code>\n\n"
+            f"<b>Recent events:</b>\n{esc(recent)}"
+        )
+        return
+
+    # ── cancel <job_id> — kill a stuck running job ────────────────────────────
+    m = re.match(r"^cancel\s+(\d+)$", text, re.IGNORECASE)
+    if m:
+        job_id = int(m.group(1))
+        job    = get_job(job_id)
+        if not job or job.user_id != user_id:
+            await update.message.reply_html("❌ Job not found.")
+            return
+        if job.status in (State.COMMITTED, State.CANCELLED, State.FAILED):
+            await update.message.reply_html(
+                f"Job #{job_id} is already <code>{esc(job.status)}</code>."
+            )
+            return
+        update_job(job_id, status=State.CANCELLED)
+        log_event(job_id, "cancelled_by_user")
+        await update.message.reply_html(f"🛑 Job #{job_id} cancelled.")
+        return
 
     # ── approve <job_id> ──────────────────────────────────────────────────────
     m = re.match(r"^approve\s+(\d+)$", text, re.IGNORECASE)
