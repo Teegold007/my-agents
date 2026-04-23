@@ -185,37 +185,46 @@ _SKILL_SENIOR_ENGINEER = """
 _SKILL_GIT = """
 ## Skill: Git Operations
 
+### CRITICAL: No shell operators allowed
+You can only run ONE simple command at a time. These are all FORBIDDEN:
+  - Shell variables:   $file  $var  ${var}
+  - Subshells:         $(command)  `command`
+  - Chaining:          cmd1; cmd2   cmd1 && cmd2   cmd1 || cmd2
+  - Pipes:             cmd1 | cmd2
+  - Loops:             for/while/if constructs
+  - Redirects:         > file  < file
+
+### How to iterate over files (the correct pattern)
+WRONG — this will be blocked:
+  for file in $(git diff --name-only); do git checkout origin/branch -- $file; done
+
+CORRECT — run each step separately:
+  Step 1: git diff HEAD origin/<branch> --name-only
+  → Read the output. You will see a list of filenames, one per line.
+  Step 2: git checkout origin/<branch> -- path/to/file1
+  Step 3: git checkout origin/<branch> -- path/to/file2
+  Step 4: git checkout origin/<branch> -- path/to/file3
+  (Repeat one command per file. Skip any files you were told to exclude.)
+
 ### Inspecting a remote branch
 Always fetch before referencing a remote branch:
   git fetch origin <branch>
 Then reference it as origin/<branch> (no checkout needed).
 
-### Copying specific files from another branch (selective cherry-pick)
+### Copying specific files from another branch (selective merge)
 DO NOT use git cherry-pick when the goal is to take only certain files.
 Cherry-pick applies whole commits and will bring unwanted changes.
-Instead, checkout individual files directly from the remote ref:
-  git fetch origin <branch>
-  git checkout origin/<branch> -- path/to/file1 path/to/file2
-This stages exactly those files from the other branch, nothing else.
+Safe sequence for "apply branch changes, exclude file X":
+  1. git fetch origin <branch>
+  2. git diff HEAD origin/<branch> --name-only       -- see which files changed
+  3. For each file NOT in the exclude list, run ONE command:
+       git checkout origin/<branch> -- <exact/path/to/file>
+  4. git diff --stat HEAD                            -- verify what changed
 
 ### Viewing what changed on another branch vs current HEAD
   git fetch origin <branch>
-  git diff HEAD origin/<branch>                     -- all changes
-  git diff HEAD origin/<branch> -- path/to/file     -- one file
   git diff HEAD origin/<branch> --name-only         -- just filenames
-
-### Excluding a file from a cherry-pick commit
-If you cherry-picked a commit and need to drop one file:
-  git cherry-pick <hash>
-  git checkout HEAD -- path/to/unwanted-file        -- restore to HEAD version
-  (The orchestrator will commit after user approval — do NOT run git commit.)
-
-### Safe sequence for "apply branch changes, exclude file X"
-  1. git fetch origin <branch>
-  2. git diff HEAD origin/<branch> --name-only       -- confirm which files changed
-  3. For each desired file: git checkout origin/<branch> -- <file>
-  4. Verify with: git diff --stat HEAD
-  (Skip files you were told to exclude — never check them out.)"""
+  git diff HEAD origin/<branch> -- path/to/file     -- one file's diff"""
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
@@ -236,7 +245,8 @@ def build_system_prompt(job: Job) -> str:
     base = f"""You are an expert coding agent on a Linux server.{repo_note}{branch_note}{extras_note}
 
 Rules:
-- Run ONE command at a time — no && or | chaining
+- Run ONE simple command at a time — absolutely no shell operators: no &&, |, ;, $var, $(), loops, or redirects
+- To iterate over files: run the discovery command first, read its output, then call bash once per file
 - Only use allowed binaries: git, python, node, npm, pytest, ls, cat, find, grep, cp, mv, mkdir, etc.
 - Read files before editing them
 - Check memory/lessons before starting — avoid known mistakes
