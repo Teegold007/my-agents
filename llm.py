@@ -284,7 +284,8 @@ async def loop_openai_compat(job: Job, status_cb) -> tuple[str, bool]:
 
 
 def _is_credit_error(e: Exception) -> bool:
-    return "credit balance is too low" in str(e).lower()
+    lower = str(e).lower()
+    return "balance is too low" in lower or "credit balance" in lower
 
 
 def _is_tool_error(e: Exception) -> bool:

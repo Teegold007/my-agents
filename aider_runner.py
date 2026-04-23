@@ -53,7 +53,10 @@ def _is_noise(line: str) -> bool:
 
 
 def _is_credit_error(output: str) -> bool:
-    return "credit balance is too low" in output.lower()
+    # The message wraps across lines ("Your credit\nbalance is too low"),
+    # so match on the part that always appears on its own line.
+    lower = output.lower()
+    return "balance is too low" in lower or "credit balance" in lower
 
 
 def _extract_error(output: str) -> str:
