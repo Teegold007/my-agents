@@ -7,6 +7,7 @@ through branch management, agent execution, diff review, and commit.
 
 import json
 import logging
+import re
 from pathlib import Path
 
 from telegram import Update
@@ -29,6 +30,37 @@ from jobs import (
 from memory import reflect_and_save
 
 logger = logging.getLogger(__name__)
+
+
+def _is_git_task(job: Job) -> bool:
+    """
+    Return True when the task is primarily a git workflow operation
+    (fetch, checkout, cherry-pick, merge, rebase, diff inspection, etc.).
+    Aider is a code editor and handles these poorly — the bash-tool agent loop
+    should be used instead.
+    """
+    # Check structured plan steps first (most reliable signal)
+    if job.plan:
+        try:
+            steps = json.loads(job.plan).get("steps", [])
+            git_steps = sum(
+                1 for s in steps
+                if re.match(r"^\s*(run:\s*)?git\s", s, re.IGNORECASE)
+            )
+            if steps and git_steps / len(steps) >= 0.5:
+                return True
+        except Exception:
+            pass
+
+    # Fall back to keyword scan of the task text
+    task_lower = job.task.lower()
+    git_keywords = (
+        "cherry-pick", "cherry pick", "git fetch", "git checkout",
+        "git diff", "git merge", "git rebase", "git log",
+        "remote branch", "origin/", "audit-log", "merge branch",
+        "pick changes from", "apply changes from",
+    )
+    return any(kw in task_lower for kw in git_keywords)
 
 
 async def start_task(
@@ -95,11 +127,12 @@ async def execute_job(update: Update, job: Job) -> None:
         except Exception:
             pass
 
-    if aider_available():
+    if aider_available() and not _is_git_task(job):
         thinking = await update.message.reply_html("⏳ Working (aider)…")
         _runner = run_aider
     else:
-        thinking = await update.message.reply_html("⏳ Working…")
+        label   = "⏳ Working (git)…" if _is_git_task(job) else "⏳ Working…"
+        thinking = await update.message.reply_html(label)
         _runner = run_agent
 
     try:
@@ -171,7 +204,7 @@ async def refine_job(update: Update, job: Job, instruction: str) -> None:
     original_task      = refined_job.task
     refined_job.task   = instruction
 
-    if aider_available():
+    if aider_available() and not _is_git_task(refined_job):
         thinking = await update.message.reply_html("⏳ Refining (aider)…")
         _runner = run_aider
     else:
