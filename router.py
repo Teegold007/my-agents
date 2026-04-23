@@ -118,6 +118,45 @@ async def _dispatch(text: str, user_id: int) -> tuple[bool, str]:
     return True, ""
 
 
+async def _chat_about_diff(question: str, job, user_id: int) -> str:
+    """
+    Answer a question about a job's diff using the stored diff as context.
+    Falls back to a generic reply if all LLMs fail.
+    """
+    from config import job_log_dir
+    from jobs import get_job_events
+
+    # Build context: diff content + job summary
+    diff_path = job_log_dir(job.id) / "diff.txt"
+    diff_text = diff_path.read_text()[:4000] if diff_path.exists() else "(diff not available)"
+
+    events    = get_job_events(job.id)
+    event_log = "\n".join(
+        f"[{e['type']}] {(e['message'] or '')[:120]}" for e in events[-10:]
+    )
+
+    system = (
+        "You are a senior engineer helping a developer review code changes before committing.\n"
+        "Answer their questions clearly and concisely based on the diff and job context below.\n"
+        "If they ask about a specific file or line, quote it from the diff.\n"
+        "Do NOT start making code changes — only answer questions about what was done.\n\n"
+        f"Job #{job.id} — Task: {job.task[:300]}\n\n"
+        f"Recent events:\n{event_log}\n\n"
+        f"Diff:\n{diff_text}"
+    )
+
+    history  = convo_get(user_id)
+    messages = history + [{"role": "user", "content": question}]
+
+    # Try Anthropic haiku first, then Groq
+    for attempt in (_try_anthropic, _try_groq):
+        reply = await attempt(system, messages)
+        if reply is not None:
+            return reply
+
+    return "I couldn't load an LLM right now. Check the diff at runs/{job.id}/diff.txt directly."
+
+
 # ── Message router ────────────────────────────────────────────────────────────
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -250,19 +289,26 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             await cmd_clone(update, ctx)
             return
 
-    # ── Refinement — further instructions while awaiting diff approval ────────
+    # ── Diff review chat / refinement ────────────────────────────────────────
     model_key = ctx.user_data.get("model", DEFAULT_MODEL)
     active    = get_active_job(user_id)
 
     if active and active.status == State.AWAITING_DIFF_APPROVAL:
-        await update.message.reply_html(
-            f"🔧 Applying changes to job #{active.id}…"
-        )
-        try:
-            await refine_job(update, active, text)
-        except Exception as e:
-            logger.exception("Refinement error")
-            await update.message.reply_html(f"❌ Refinement failed: <code>{esc(str(e))}</code>")
+        is_task, chat_reply = await _dispatch(text, user_id)
+        if not is_task:
+            # Conversational — answer with full diff context
+            reply = await _chat_about_diff(text, active, user_id)
+            convo_add(user_id, "user",      text)
+            convo_add(user_id, "assistant", reply)
+            await update.message.reply_html(send_html(esc(reply)))
+        else:
+            # Refinement instruction — make more code changes
+            await update.message.reply_html(f"🔧 Applying changes to job #{active.id}…")
+            try:
+                await refine_job(update, active, text)
+            except Exception as e:
+                logger.exception("Refinement error")
+                await update.message.reply_html(f"❌ Refinement failed: <code>{esc(str(e))}</code>")
         return
 
     # ── Plan feedback — revise instead of queuing a new job ──────────────────

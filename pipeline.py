@@ -214,15 +214,29 @@ async def execute_job(update: Update, job: Job) -> None:
 
         if diff_stat.strip() or untracked.strip():
             (job_log_dir(job.id) / "diff.txt").write_text(diff_full)
-            preview = diff_stat[:1500] if diff_stat.strip() else untracked[:1500]
             update_job(job.id, status=State.AWAITING_DIFF_APPROVAL)
             log_event(job.id, "awaiting_diff_approval")
-            await update.message.reply_html(
-                f"<b>📋 Diff — Job #{job.id}</b>\n"
-                f"<pre>{esc(preview)}</pre>\n\n"
-                f"Full diff saved to <code>runs/{job.id}/diff.txt</code>\n\n"
-                f"Reply <b>approve {job.id}</b> to commit, or <b>revert {job.id}</b> to undo."
+
+            review = await _generate_diff_review(job.task, diff_stat, diff_full)
+
+            stat_preview = diff_stat[:1000] if diff_stat.strip() else untracked[:1000]
+            parts = [f"<b>📋 Review — Job #{job.id}</b>"]
+
+            if review.get("summary"):
+                parts.append(f"\n<b>What changed:</b>\n{esc(review['summary'])}")
+            if review.get("notes"):
+                parts.append(f"\n<b>⚠️ Notes:</b>\n{esc(review['notes'])}")
+            if review.get("commit_subject"):
+                parts.append(f"\n<b>Proposed commit:</b>\n<code>{esc(review['commit_subject'])}</code>")
+
+            parts.append(f"\n<b>Files:</b>\n<pre>{esc(stat_preview)}</pre>")
+            parts.append(
+                f"\nReply <b>approve {job.id}</b> to commit, "
+                f"<b>revert {job.id}</b> to discard, "
+                f"or tell me what to change."
             )
+
+            await update.message.reply_html(send_html("\n".join(parts)))
             return
 
         if tools_used:
@@ -288,15 +302,25 @@ async def refine_job(update: Update, job: Job, instruction: str) -> None:
 
     if diff_stat.strip() or untracked.strip():
         (job_log_dir(job.id) / "diff.txt").write_text(diff_full)
-        preview = diff_stat[:1500] if diff_stat.strip() else untracked[:1500]
         update_job(job.id, status=State.AWAITING_DIFF_APPROVAL)
         log_event(job.id, "awaiting_diff_approval")
-        await update.message.reply_html(
-            f"<b>📋 Updated Diff — Job #{job.id}</b>\n"
-            f"<pre>{esc(preview)}</pre>\n\n"
-            f"Reply <b>approve {job.id}</b> to commit, <b>revert {job.id}</b> to undo, "
+
+        review = await _generate_diff_review(job.task, diff_stat, diff_full)
+        stat_preview = diff_stat[:1000] if diff_stat.strip() else untracked[:1000]
+        parts = [f"<b>📋 Updated Review — Job #{job.id}</b>"]
+        if review.get("summary"):
+            parts.append(f"\n<b>What changed:</b>\n{esc(review['summary'])}")
+        if review.get("notes"):
+            parts.append(f"\n<b>⚠️ Notes:</b>\n{esc(review['notes'])}")
+        if review.get("commit_subject"):
+            parts.append(f"\n<b>Proposed commit:</b>\n<code>{esc(review['commit_subject'])}</code>")
+        parts.append(f"\n<b>Files:</b>\n<pre>{esc(stat_preview)}</pre>")
+        parts.append(
+            f"\nReply <b>approve {job.id}</b> to commit, "
+            f"<b>revert {job.id}</b> to discard, "
             f"or keep giving instructions."
         )
+        await update.message.reply_html(send_html("\n".join(parts)))
     else:
         update_job(job.id, status=State.AWAITING_DIFF_APPROVAL)
         await update.message.reply_html(
@@ -304,15 +328,88 @@ async def refine_job(update: Update, job: Job, instruction: str) -> None:
         )
 
 
+_DIFF_REVIEW_PROMPT = """\
+You are a senior engineer reviewing a code change before it is committed.
+Given the original task and the git diff, produce:
+1. A clear explanation of WHAT was changed and WHY (2-4 sentences, plain English, no code blocks)
+2. Any risks, assumptions, or follow-up items the reviewer should know
+3. A conventional-commit formatted commit message (subject ≤72 chars, blank line, body)
+
+Respond ONLY with valid JSON, no markdown fences:
+{
+  "summary": "plain-English explanation of what changed and why",
+  "notes": "risks, assumptions, or follow-up items (empty string if none)",
+  "commit_subject": "type(scope): short description",
+  "commit_body": "longer explanation of why these changes were made"
+}"""
+
+
+async def _generate_diff_review(task: str, diff_stat: str, diff_full: str) -> dict:
+    """Call an LLM to produce a human summary + proper commit message. Never raises."""
+    import re as _re, json as _json
+    prompt = (
+        f"Task: {task}\n\n"
+        f"Files changed:\n{diff_stat[:800]}\n\n"
+        f"Diff (truncated):\n{diff_full[:3000]}"
+    )
+    providers = [
+        ("groq",       "llama-3.3-70b-versatile",         "openai"),
+        ("anthropic",  "claude-haiku-4-5-20251001",        "anthropic"),
+        ("openrouter", "deepseek/deepseek-chat",            "openai"),
+    ]
+    for provider, model_id, api_type in providers:
+        try:
+            if api_type == "anthropic":
+                from llm import get_anthropic_client
+                client = get_anthropic_client()
+                resp   = await client.messages.create(
+                    model=model_id, max_tokens=512,
+                    system=_DIFF_REVIEW_PROMPT,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                raw = resp.content[0].text.strip()
+            else:
+                from llm import get_openai_client
+                client = get_openai_client(provider)
+                resp   = await client.chat.completions.create(
+                    model=model_id, max_tokens=512,
+                    messages=[
+                        {"role": "system", "content": _DIFF_REVIEW_PROMPT},
+                        {"role": "user",   "content": prompt},
+                    ],
+                )
+                raw = resp.choices[0].message.content.strip()
+            raw = _re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = _re.sub(r"\s*```$", "", raw)
+            return _json.loads(raw)
+        except Exception as e:
+            logger.warning(f"Diff review via {provider}/{model_id} failed: {e}")
+
+    return {}   # all providers failed — caller uses fallback
+
+
 async def commit_job(update: Update, job: Job) -> None:
     """Commit approved changes and notify the user."""
-    import re
-    commit_msg = re.sub(r"[^\w\s\-]", "", job.task)[:72]
-    cwd        = job.repo_path
+    cwd       = job.repo_path
+
+    # Generate a proper commit message from the stored diff
+    diff_path = job_log_dir(job.id) / "diff.txt"
+    diff_full = diff_path.read_text() if diff_path.exists() else ""
+    _, diff_stat = safe_run(["git", "diff", "--stat", "HEAD"], cwd=cwd)
+
+    review = await _generate_diff_review(job.task, diff_stat, diff_full)
+
+    if review.get("commit_subject"):
+        subject = review["commit_subject"][:72]
+        body    = review.get("commit_body", "")
+        commit_msg = f"{subject}\n\n{body}".strip() if body else subject
+    else:
+        # Fallback: clean slug from task
+        commit_msg = re.sub(r"[^\w\s\-]", "", job.task)[:72]
 
     safe_run(["git", "add", "-A"], cwd=cwd)
     safe_run(
-        ["git", "commit", "-m", f"agent: {commit_msg}"],
+        ["git", "commit", "-m", commit_msg],
         cwd=cwd,
         log_path=str(job_log_dir(job.id) / "commit.log"),
     )
@@ -328,7 +425,8 @@ async def commit_job(update: Update, job: Job) -> None:
     await update.message.reply_html(
         f"✅ <b>Job #{job.id} committed</b>\n"
         f"Branch: <code>{esc(job.branch or 'unknown')}</code>\n"
-        f"Commit: <code>{esc(commit_hash)}</code>\n\n"
+        f"Commit: <code>{esc(commit_hash)}</code>\n"
+        f"Message: <i>{esc(commit_msg.splitlines()[0])}</i>\n\n"
         f"Reply <b>push {job.id}</b> to push the branch, or merge manually."
     )
 
