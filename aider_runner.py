@@ -14,15 +14,14 @@ import shutil
 
 from config import (
     ANTHROPIC_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY,
-    MODELS, esc,
+    MODELS, FALLBACK_MODELS, esc,
 )
 from executor import _AUGMENTED_PATH
-from jobs import Job, log_event
+from jobs import Job, log_event, update_job
 
 logger = logging.getLogger(__name__)
 
 # Map our model keys → litellm model strings that aider accepts.
-# Anthropic models work bare; OpenRouter and Groq need the provider prefix.
 AIDER_MODEL_MAP: dict[str, str] = {
     "haiku":    "anthropic/claude-haiku-4-5-20251001",
     "sonnet":   "anthropic/claude-sonnet-4-6",
@@ -33,7 +32,10 @@ AIDER_MODEL_MAP: dict[str, str] = {
     "r1":       "openrouter/deepseek/deepseek-r1",
 }
 
-# Lines that are pure decoration — skip them to avoid spamming the user.
+# Fallback when Anthropic credits run out — must support tools via aider
+CREDIT_FALLBACK = "deepseek"
+
+# Lines that are pure decoration — skip to avoid spamming the user.
 _NOISE_PREFIXES = ("─", "━", "Aider v", "Model:", "Git repo:", "Repo-map:")
 
 
@@ -49,23 +51,20 @@ def _is_noise(line: str) -> bool:
     return any(s.startswith(p) for p in _NOISE_PREFIXES)
 
 
-async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
-    """
-    Run aider non-interactively for job.task in job.repo_path.
+def _is_credit_error(output: str) -> bool:
+    return "credit balance is too low" in output.lower()
 
-    Streams meaningful output back via status_cb in small batches.
-    Returns (full_output, tools_used=True).
-    Raises RuntimeError on non-zero exit.
-    """
-    model_str = AIDER_MODEL_MAP.get(job.model, "anthropic/claude-sonnet-4-6")
-    cwd       = job.repo_path or os.getcwd()
+
+async def _run_aider_once(model_str: str, job: Job, status_cb) -> tuple[str, int]:
+    """Spawn aider for a single model attempt. Returns (output, returncode)."""
+    cwd = job.repo_path or os.getcwd()
 
     env = {
         **os.environ,
-        "PATH":               _AUGMENTED_PATH,
-        "ANTHROPIC_API_KEY":  ANTHROPIC_API_KEY,
-        "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
-        "GROQ_API_KEY":       GROQ_API_KEY,
+        "PATH":                _AUGMENTED_PATH,
+        "ANTHROPIC_API_KEY":   ANTHROPIC_API_KEY,
+        "OPENROUTER_API_KEY":  OPENROUTER_API_KEY,
+        "GROQ_API_KEY":        GROQ_API_KEY,
         "GIT_TERMINAL_PROMPT": "0",
     }
 
@@ -73,14 +72,14 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
         "aider",
         "--message",        job.task,
         "--model",          model_str,
-        "--no-auto-commits",   # we handle git commit after user approval
-        "--yes-always",        # no interactive prompts
-        "--no-pretty",         # plain text output
-        "--no-fancy-input",    # no readline / colour escape codes
+        "--no-auto-commits",
+        "--yes-always",
+        "--no-pretty",
+        "--no-fancy-input",
     ]
 
     log_event(job.id, "aider_start", f"model={model_str}")
-    logger.info(f"[job {job.id}] aider start: {model_str} in {cwd}")
+    logger.info(f"[job {job.id}] aider: {model_str} in {cwd}")
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -91,12 +90,10 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
             stderr=asyncio.subprocess.STDOUT,
         )
     except FileNotFoundError:
-        raise RuntimeError(
-            "aider not found — install it with: pip install aider-chat"
-        )
+        raise RuntimeError("aider not found — run: pip install aider-chat")
 
-    lines:  list[str] = []
-    batch:  list[str] = []
+    lines: list[str] = []
+    batch: list[str] = []
 
     async def flush() -> None:
         if batch:
@@ -116,12 +113,56 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
     await flush()
     await proc.wait()
 
-    output = "\n".join(lines)
-    log_event(job.id, "aider_done", f"rc={proc.returncode}")
+    return "\n".join(lines), proc.returncode
 
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"aider exited {proc.returncode}:\n{output[-600:]}"
-        )
 
-    return output, True   # tools_used=True — aider always edits files directly
+async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
+    """
+    Run aider non-interactively with automatic fallback on credit/model errors.
+
+    Returns (full_output, tools_used=True).
+    Raises RuntimeError only when all fallbacks are exhausted.
+    """
+    model_key = job.model
+    tried: set[str] = set()
+
+    while True:
+        model_str = AIDER_MODEL_MAP.get(model_key, "anthropic/claude-sonnet-4-6")
+
+        if model_key in tried:
+            raise RuntimeError(f"All fallbacks exhausted. Last model: {model_key}")
+        tried.add(model_key)
+
+        output, rc = await _run_aider_once(model_str, job, status_cb)
+        log_event(job.id, "aider_done", f"rc={rc} model={model_key}")
+
+        if rc == 0:
+            return output, True
+
+        # Detect credit exhaustion → switch to non-Anthropic fallback
+        if _is_credit_error(output) and MODELS.get(model_key, {}).get("provider") == "anthropic":
+            fallback = CREDIT_FALLBACK
+            await status_cb(
+                f"💳 <i>Anthropic credits exhausted — switching to "
+                f"{esc(MODELS[fallback]['label'])}.</i>"
+            )
+            log_event(job.id, "model_fallback", f"{model_key} → {fallback}: credit exhausted")
+            update_job(job.id, model=fallback)
+            job.model = fallback
+            model_key  = fallback
+            continue
+
+        # Any other non-zero exit → try FALLBACK_MODELS chain
+        fallback = FALLBACK_MODELS.get(model_key)
+        if fallback and fallback not in tried:
+            await status_cb(
+                f"⚠️ <i>{esc(MODELS[model_key]['label'])} failed — retrying with "
+                f"{esc(MODELS[fallback]['label'])}.</i>"
+            )
+            log_event(job.id, "model_fallback", f"{model_key} → {fallback}: rc={rc}")
+            update_job(job.id, model=fallback)
+            job.model = fallback
+            model_key  = fallback
+            continue
+
+        raise RuntimeError(f"aider exited {rc}:\n{output[-600:]}")
