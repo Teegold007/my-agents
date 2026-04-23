@@ -128,57 +128,60 @@ async def _run_aider_once(model_str: str, job: Job, status_cb) -> tuple[str, int
     except FileNotFoundError:
         raise RuntimeError("aider not found — run: pip install aider-chat")
 
-    lines: list[str] = []
-    batch: list[str] = []
-    timed_out = False
+    lines:     list[str] = []
+    batch:     list[str] = []
+    killed_by: str | None = None
+
+    # Consecutive error lines before we give up and kill the process.
+    # Aider reprints the analysis on every retry, so we look for the
+    # error line specifically repeating rather than any output stopping.
+    _MAX_ERROR_REPEATS = 2
+    error_count = 0
 
     async def flush() -> None:
         if batch:
             await status_cb("⚙️ <code>" + esc("\n".join(batch)) + "</code>")
             batch.clear()
 
-    async def read_output() -> None:
-        assert proc.stdout
-        async for raw in proc.stdout:
-            line = raw.decode(errors="replace").rstrip()
-            lines.append(line)
-            if _is_noise(line):
-                continue
-            batch.append(line)
-            if len(batch) >= 6:
-                await flush()
-        await flush()
-
-    async def watchdog() -> None:
-        nonlocal timed_out
-        # Kill if idle (no new lines) for _IDLE_TIMEOUT seconds
-        while True:
-            before = len(lines)
-            await asyncio.sleep(_IDLE_TIMEOUT)
-            if proc.returncode is not None:
-                break
-            if len(lines) == before:          # no new output → stuck
-                timed_out = True
-                proc.kill()
-                logger.warning(f"[job {job.id}] aider idle timeout — killed {model_str}")
-                break
-
+    assert proc.stdout
     try:
-        await asyncio.wait_for(
-            asyncio.gather(read_output(), watchdog()),
-            timeout=_AIDER_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        timed_out = True
-        proc.kill()
-        logger.warning(f"[job {job.id}] aider wall-clock timeout — killed {model_str}")
+        async with asyncio.timeout(_AIDER_TIMEOUT):
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace").rstrip()
+                lines.append(line)
 
+                # Kill as soon as the provider error line appears enough times —
+                # aider will just keep retrying otherwise.
+                if _is_provider_error(line) or _is_credit_error(line):
+                    error_count += 1
+                    if error_count >= _MAX_ERROR_REPEATS:
+                        killed_by = "provider error"
+                        proc.kill()
+                        break
+
+                if _is_noise(line):
+                    continue
+                batch.append(line)
+                if len(batch) >= 6:
+                    await flush()
+    except asyncio.TimeoutError:
+        killed_by = "wall-clock timeout"
+        proc.kill()
+        logger.warning(f"[job {job.id}] aider timeout — killed {model_str}")
+
+    await flush()
+    # Drain remaining stdout so the pipe doesn't block
+    if proc.stdout and not proc.stdout.at_eof():
+        try:
+            await asyncio.wait_for(proc.stdout.read(), timeout=2)
+        except asyncio.TimeoutError:
+            pass
     await proc.wait()
 
-    if timed_out:
-        lines.append("[aider timed out — provider did not respond]")
+    if killed_by:
+        lines.append(f"[aider killed: {killed_by}]")
 
-    return "\n".join(lines), proc.returncode if not timed_out else 1
+    return "\n".join(lines), proc.returncode if not killed_by else 1
 
 
 async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
