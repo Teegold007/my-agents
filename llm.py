@@ -88,6 +88,65 @@ def agent_run(command_str: str, cwd: str, job_id: int, step: int) -> str:
         log_event(job_id, "blocked", str(e))
         return f"[blocked] {e}"
 
+# ── Skill blocks (distilled from superpowers.dev) ────────────────────────────
+
+_SKILL_DEBUGGING = """
+## Skill: Systematic Debugging
+ALWAYS find the root cause before proposing any fix. Symptom-fixes are failure.
+
+Phase 1 — Root cause investigation (MANDATORY before touching any code):
+  1. Read the full error message and stack trace — it often contains the answer.
+  2. Reproduce reliably. If you can't reproduce it, gather more data first.
+  3. Check recent changes: git diff, new deps, config edits.
+  4. In multi-layer systems, add diagnostic logging at each boundary to find
+     WHICH layer is broken before writing a fix.
+  5. Trace data flow backward — find where the bad value originates, not just
+     where it surfaces.
+
+Phase 2 — Pattern analysis: find a working counterexample, compare line by line.
+
+Phase 3 — Hypothesis: state ONE clear theory, make the smallest possible change
+to test it, verify before adding anything else.
+
+Phase 4 — Implementation:
+  - Write a failing test that reproduces the bug FIRST.
+  - Apply ONE fix targeting the root cause.
+  - If 3+ fixes have failed, STOP — the architecture may be wrong. Say so.
+
+Red flags — return to Phase 1 if you notice:
+  "quick fix for now" · "just try changing X" · "probably X, let me fix it" ·
+  proposing solutions before tracing data flow · each fix revealing a new problem."""
+
+_SKILL_TDD = """
+## Skill: Test-Driven Development
+Iron law: NO production code without a failing test first.
+
+Red → Green → Refactor:
+  RED:    Write one minimal test describing the desired behaviour.
+          Run it. Confirm it fails for the RIGHT reason (feature missing, not syntax error).
+  GREEN:  Write the simplest code that makes the test pass. Nothing more.
+          Run the test suite. All tests must be green.
+  REFACTOR: Clean up duplication and names while keeping tests green.
+  Repeat for the next behaviour.
+
+Rules:
+  - If you wrote code before the test: delete it, start over.
+  - If the test passes immediately: you're testing existing behaviour, fix the test.
+  - Never fix a bug without first writing a test that reproduces it.
+  - "I'll add tests after" = not TDD. The value is in watching the test fail first."""
+
+_SKILL_DEFENSE_IN_DEPTH = """
+## Skill: Defense-in-Depth Validation
+When you fix a bug caused by bad data, validate at EVERY layer, not just one.
+
+Layer 1 — Entry point: reject obviously invalid input at the API boundary.
+Layer 2 — Business logic: ensure data makes sense for this specific operation.
+Layer 3 — Environment guards: in tests, refuse dangerous operations outside safe paths
+           (e.g. refuse git init outside a tmp directory).
+Layer 4 — Debug instrumentation: log context + stack trace before the dangerous operation.
+
+Goal: make the bug structurally impossible, not just "fixed at one place"."""
+
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 def build_system_prompt(job: Job) -> str:
@@ -117,7 +176,13 @@ Rules:
 End your response with:
 📝 Changes made
 📁 Files changed
-⚠️  Notes"""
+⚠️  Notes
+
+{_SKILL_DEBUGGING}
+
+{_SKILL_TDD}
+
+{_SKILL_DEFENSE_IN_DEPTH}"""
 
     return base + "\n\n" + memory if memory else base
 
