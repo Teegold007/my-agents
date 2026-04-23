@@ -18,7 +18,7 @@ from config import (
     detect_complexity, detect_repo, make_branch, job_log_dir,
     esc, send_html,
 )
-from conversation import convo_add, bg
+from conversation import convo_add, convo_clear, bg
 from llm import run_agent
 from aider_runner import aider_available, run_aider
 from planner import generate_plan, format_plan_html
@@ -122,6 +122,11 @@ async def start_task(
     job = create_job(user_id, task, model_key, repo=repo, repo_path=repo_path)
     cfg = MODELS[model_key]
 
+    # Clear conversation history when starting a fresh job so stale output from
+    # a previous session (different repo, different task) doesn't contaminate
+    # the new agent loop.
+    convo_clear(user_id)
+
     repo_label = f" · <code>{esc(repo)}</code>" if repo else ""
     await update.message.reply_html(
         f"🤖 <b>{esc(cfg['label'])}</b>{repo_label} · Job <code>#{job.id}</code>"
@@ -202,8 +207,11 @@ async def execute_job(update: Update, job: Job) -> None:
     update_job(job.id, result=result[:2000])
     log_event(job.id, "execution_done", result[:200])
 
-    convo_add(job.user_id, "user",      job.task)
-    convo_add(job.user_id, "assistant", result)
+    # Store a short task summary in conversation history — NOT the full agent output.
+    # Full aider/agent output often contains tool noise that poisons future LLM calls.
+    summary_line = result.splitlines()[0][:200] if result else "Task completed."
+    convo_add(job.user_id, "user",      job.task[:300])
+    convo_add(job.user_id, "assistant", f"[Completed] {summary_line}")
 
     await update.message.reply_html(send_html(esc(result)))
 
@@ -291,8 +299,9 @@ async def refine_job(update: Update, job: Job, instruction: str) -> None:
     await thinking.delete()
     update_job(job.id, result=result[:2000])
     log_event(job.id, "refinement_done", result[:200])
-    convo_add(job.user_id, "user",      instruction)
-    convo_add(job.user_id, "assistant", result)
+    summary_line = result.splitlines()[0][:200] if result else "Refinement completed."
+    convo_add(job.user_id, "user",      instruction[:300])
+    convo_add(job.user_id, "assistant", f"[Refined] {summary_line}")
     await update.message.reply_html(send_html(esc(result)))
 
     # Show updated diff
