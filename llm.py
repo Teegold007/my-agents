@@ -240,7 +240,7 @@ Rules:
 - Only use allowed binaries: git, python, node, npm, pytest, ls, cat, find, grep, cp, mv, mkdir, etc.
 - Read files before editing them
 - Check memory/lessons before starting — avoid known mistakes
-- DO NOT run git commit — the orchestrator handles that after user approval
+- DO NOT run git commit or git push — the orchestrator handles that after user approval
 - After making changes, summarise what you did
 
 End your response with:
