@@ -86,8 +86,8 @@ _AIDER_TIMEOUT = 180   # seconds before we kill aider and try the next model
 _IDLE_TIMEOUT   = 30
 
 
-async def _run_aider_once(model_str: str, job: Job, status_cb) -> tuple[str, int]:
-    """Spawn aider for a single model attempt. Returns (output, returncode).
+async def _run_aider_once(model_str: str, job: Job, status_cb) -> tuple[str, int, str | None]:
+    """Spawn aider for a single model attempt. Returns (output, returncode, killed_by_reason).
 
     Kills the process if:
     - total wall time exceeds _AIDER_TIMEOUT, or
@@ -147,7 +147,17 @@ async def _run_aider_once(model_str: str, job: Job, status_cb) -> tuple[str, int
     assert proc.stdout
     try:
         async with asyncio.timeout(_AIDER_TIMEOUT):
-            async for raw in proc.stdout:
+            while True:
+                try:
+                    raw = await asyncio.wait_for(proc.stdout.readline(), timeout=_IDLE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    killed_by = "idle timeout"
+                    proc.kill()
+                    break
+
+                if not raw:
+                    break
+
                 line = raw.decode(errors="replace").rstrip()
                 lines.append(line)
 
@@ -203,22 +213,22 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
     tried: set[str] = set()
 
     while True:
-        model_str = AIDER_MODEL_MAP.get(model_key, "anthropic/claude-sonnet-4-6")
-
         if model_key in tried:
-            raise RuntimeError(f"All fallbacks exhausted. Last model: {model_key}")
+            raise RuntimeError(f"All fallbacks exhausted. Last model attempted: {model_key}")
         tried.add(model_key)
 
+        model_str = AIDER_MODEL_MAP.get(model_key, "anthropic/claude-sonnet-4-6")
         output, rc, killed_by = await _run_aider_once(model_str, job, status_cb)
         log_event(job.id, "aider_done", f"rc={rc} killed_by={killed_by} model={model_key}")
 
-        # aider exits 0 even on credit/provider errors — check output regardless of rc
-        if rc == 0 and not _is_credit_error(output) and not _is_provider_error(output):
-            return output, True
-        if rc == 0 and _is_credit_error(output):
+        # Check for errors in output regardless of exit code, as aider's exit
+        # code is not always reliable for API failures.
+        if _is_credit_error(output):
             killed_by = "credit exhausted"
-        if rc == 0 and _is_provider_error(output):
+        elif _is_provider_error(output):
             killed_by = killed_by or "provider error"
+
+        # Success condition: exit code is 0 and no errors were detected.
         if rc == 0 and not killed_by:
             return output, True
 
@@ -239,19 +249,18 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
             model_key  = fallback
             continue
 
-        # Provider error — follow fallback chain
-        if killed_by == "provider error" or _is_provider_error(output):
-            fallback = FALLBACK_MODELS.get(model_key) or (
-                CREDIT_FALLBACK if model_key != CREDIT_FALLBACK else None
+        # Provider error or timeout — follow fallback chain
+        fallback = FALLBACK_MODELS.get(model_key) or (
+            CREDIT_FALLBACK if model_key != CREDIT_FALLBACK else None
+        )
+        if fallback and fallback not in tried:
+            await status_cb(
+                f"🔄 <i>{esc(model_key)} failed ({killed_by or 'error'}) — switching to {esc(MODELS[fallback]['label'])}…</i>"
             )
-            if fallback and fallback not in tried:
-                await status_cb(
-                    f"🔄 <i>Switching to {esc(MODELS[fallback]['label'])}…</i>"
-                )
-                log_event(job.id, "model_fallback", f"{model_key} → {fallback}: {err_msg[:80]}")
-                update_job(job.id, model=fallback)
-                job.model = fallback
-                model_key  = fallback
-                continue
+            log_event(job.id, "model_fallback", f"{model_key} → {fallback}: {err_msg[:80]}")
+            update_job(job.id, model=fallback)
+            job.model = fallback
+            model_key = fallback
+            continue
 
         raise RuntimeError(f"aider exited {rc}: {err_msg}")
