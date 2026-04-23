@@ -33,8 +33,8 @@ AIDER_MODEL_MAP: dict[str, str] = {
 }
 
 # Ordered preference for non-Anthropic models when credits run out.
-# First untried model in this list is used.
-_CREDIT_FALLBACK_ORDER = ("deepseek", "llama", "qwen")
+# llama is excluded — it's a free-tier Groq model with rate limits, not suitable for aider.
+_CREDIT_FALLBACK_ORDER = ("deepseek", "qwen")
 
 # Lines that are pure decoration — skip to avoid spamming the user.
 _NOISE_PREFIXES = ("─", "━", "Aider v", "Model:", "Git repo:", "Repo-map:")
@@ -85,9 +85,13 @@ def _is_provider_error(output: str) -> bool:
     ))
 
 
-_AIDER_TIMEOUT = 180   # seconds before we kill aider and try the next model
+_AIDER_TIMEOUT = 360   # seconds before we kill aider and try the next model
 # How long output can be idle before we assume aider is stuck retrying.
-_IDLE_TIMEOUT   = 30
+_IDLE_TIMEOUT   = 60
+# How many times to retry a transient provider 500 before falling back to another model.
+_MAX_PROVIDER_RETRIES = 2
+# Seconds to wait between provider-error retries.
+_PROVIDER_RETRY_DELAY = 5
 
 
 async def _run_aider_once(model_str: str, job: Job, status_cb) -> tuple[str, int, str | None]:
@@ -210,13 +214,19 @@ async def _run_aider_once(model_str: str, job: Job, status_cb) -> tuple[str, int
 
 async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
     """
-    Run aider non-interactively with automatic fallback on credit/model errors.
+    Run aider non-interactively with automatic retry + fallback on errors.
+
+    Retry strategy:
+    - Transient provider 500s → retry up to _MAX_PROVIDER_RETRIES times (same model)
+    - Credit exhaustion       → switch to first untried non-Anthropic model
+    - Timeout / fatal error   → follow FALLBACK_MODELS chain
 
     Returns (full_output, tools_used=True).
-    Raises RuntimeError only when all fallbacks are exhausted.
+    Raises RuntimeError only when all options are exhausted.
     """
-    model_key = job.model
+    model_key       = job.model
     tried: set[str] = set()
+    provider_retries: dict[str, int] = {}   # model_key → retry count
 
     while True:
         if model_key in tried:
@@ -227,22 +237,38 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
         output, rc, killed_by = await _run_aider_once(model_str, job, status_cb)
         log_event(job.id, "aider_done", f"rc={rc} killed_by={killed_by} model={model_key}")
 
-        # Check for errors in output regardless of exit code, as aider's exit
-        # code is not always reliable for API failures.
+        # Normalise error classification from output content
         if _is_credit_error(output):
             killed_by = "credit exhausted"
         elif _is_provider_error(output):
             killed_by = killed_by or "provider error"
 
-        # Success condition: exit code is 0 and no errors were detected.
+        # ── Success ───────────────────────────────────────────────────────────
         if rc == 0 and not killed_by:
             return output, True
 
         err_msg = _extract_error(output)
-        await status_cb(f"❌ <i>{esc(err_msg)}</i>")
         logger.warning(f"[job {job.id}] aider failed ({model_key}): {err_msg}")
 
-        # Credit exhaustion — pick the first untried non-Anthropic model
+        # ── Transient provider 500 — retry same model before falling back ─────
+        if killed_by == "provider error":
+            retries_so_far = provider_retries.get(model_key, 0)
+            if retries_so_far < _MAX_PROVIDER_RETRIES:
+                provider_retries[model_key] = retries_so_far + 1
+                wait = _PROVIDER_RETRY_DELAY * (retries_so_far + 1)
+                await status_cb(
+                    f"⚠️ <i>{esc(MODELS.get(model_key, {}).get('label', model_key))} "
+                    f"returned a server error — retrying in {wait}s "
+                    f"({retries_so_far + 1}/{_MAX_PROVIDER_RETRIES})…</i>"
+                )
+                log_event(job.id, "provider_retry", f"{model_key} attempt {retries_so_far + 1}")
+                await asyncio.sleep(wait)
+                tried.discard(model_key)   # allow re-trying the same model
+                continue
+
+        await status_cb(f"❌ <i>{esc(err_msg)}</i>")
+
+        # ── Credit exhaustion → first untried non-Anthropic model ─────────────
         if killed_by == "credit exhausted":
             fallback = next(
                 (m for m in _CREDIT_FALLBACK_ORDER if m not in tried),
@@ -255,18 +281,20 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
                 )
                 log_event(job.id, "model_fallback", f"{model_key} → {fallback}: credit exhausted")
                 update_job(job.id, model=fallback)
-                job.model = fallback
+                job.model  = fallback
                 model_key  = fallback
                 continue
             raise RuntimeError("Anthropic credits exhausted and all non-Anthropic fallbacks already tried.")
 
-        # Provider error or timeout — follow fallback chain
+        # ── Timeout / exhausted retries / fatal error → follow fallback chain ─
+        CREDIT_FALLBACK = _CREDIT_FALLBACK_ORDER[0]
         fallback = FALLBACK_MODELS.get(model_key) or (
             CREDIT_FALLBACK if model_key != CREDIT_FALLBACK else None
         )
         if fallback and fallback not in tried:
             await status_cb(
-                f"🔄 <i>{esc(model_key)} failed ({killed_by or 'error'}) — switching to {esc(MODELS[fallback]['label'])}…</i>"
+                f"🔄 <i>{esc(model_key)} failed ({killed_by or 'error'}) "
+                f"— switching to {esc(MODELS[fallback]['label'])}…</i>"
             )
             log_event(job.id, "model_fallback", f"{model_key} → {fallback}: {err_msg[:80]}")
             update_job(job.id, model=fallback)
