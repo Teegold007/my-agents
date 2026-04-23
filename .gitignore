@@ -1,6 +1,7 @@
-.env,
-memory.db,
-venv,
+.env
+memory.db
+venv
 __pycache__
 .idea
 /.claude/
+.aider*

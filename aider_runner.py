@@ -110,13 +110,15 @@ async def _run_aider_once(model_str: str, job: Job, status_cb) -> tuple[str, int
 
     cmd = [
         "aider",
-        "--message",        job.task,
-        "--model",          model_str,
+        "--message",              job.task,
+        "--model",                model_str,
         "--no-auto-commits",
         "--yes-always",
         "--no-pretty",
         "--no-fancy-input",
-        "--no-gitignore",   # don't touch .gitignore — we manage git ourselves
+        "--no-gitignore",         # don't touch .gitignore
+        "--chat-history-file",    f"/tmp/aider-chat-{job.id}.md",
+        "--input-history-file",   f"/tmp/aider-input-{job.id}.history",
     ]
 
     log_event(job.id, "aider_start", f"model={model_str}")
