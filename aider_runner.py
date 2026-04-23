@@ -55,8 +55,44 @@ def _is_credit_error(output: str) -> bool:
     return "credit balance is too low" in output.lower()
 
 
+def _extract_error(output: str) -> str:
+    """Pull the most relevant error line out of aider's output."""
+    for line in reversed(output.splitlines()):
+        s = line.strip()
+        if any(kw in s for kw in ("Error", "error", "Exception", "timed out")):
+            # Trim litellm prefix noise for readability
+            s = s.replace("litellm.APIError: APIError: ", "")
+            s = s.replace("litellm.BadRequestError: ", "")
+            return s[:200]
+    return "unknown error"
+
+
+def _is_provider_error(output: str) -> bool:
+    """Return True for transient or fatal provider-side failures."""
+    lower = output.lower()
+    return any(phrase in lower for phrase in (
+        "internal server error",
+        "error_type': 'server'",
+        "bad gateway",
+        "service unavailable",
+        "no endpoints found",
+        "apiconnectionerror",
+        "apierror",
+    ))
+
+
+_AIDER_TIMEOUT = 180   # seconds before we kill aider and try the next model
+# How long output can be idle before we assume aider is stuck retrying.
+_IDLE_TIMEOUT   = 30
+
+
 async def _run_aider_once(model_str: str, job: Job, status_cb) -> tuple[str, int]:
-    """Spawn aider for a single model attempt. Returns (output, returncode)."""
+    """Spawn aider for a single model attempt. Returns (output, returncode).
+
+    Kills the process if:
+    - total wall time exceeds _AIDER_TIMEOUT, or
+    - no new output for _IDLE_TIMEOUT seconds (stuck in litellm retry loop).
+    """
     cwd = job.repo_path or os.getcwd()
 
     env = {
@@ -94,26 +130,55 @@ async def _run_aider_once(model_str: str, job: Job, status_cb) -> tuple[str, int
 
     lines: list[str] = []
     batch: list[str] = []
+    timed_out = False
 
     async def flush() -> None:
         if batch:
             await status_cb("⚙️ <code>" + esc("\n".join(batch)) + "</code>")
             batch.clear()
 
-    assert proc.stdout
-    async for raw in proc.stdout:
-        line = raw.decode(errors="replace").rstrip()
-        lines.append(line)
-        if _is_noise(line):
-            continue
-        batch.append(line)
-        if len(batch) >= 6:
-            await flush()
+    async def read_output() -> None:
+        assert proc.stdout
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace").rstrip()
+            lines.append(line)
+            if _is_noise(line):
+                continue
+            batch.append(line)
+            if len(batch) >= 6:
+                await flush()
+        await flush()
 
-    await flush()
+    async def watchdog() -> None:
+        nonlocal timed_out
+        # Kill if idle (no new lines) for _IDLE_TIMEOUT seconds
+        while True:
+            before = len(lines)
+            await asyncio.sleep(_IDLE_TIMEOUT)
+            if proc.returncode is not None:
+                break
+            if len(lines) == before:          # no new output → stuck
+                timed_out = True
+                proc.kill()
+                logger.warning(f"[job {job.id}] aider idle timeout — killed {model_str}")
+                break
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(read_output(), watchdog()),
+            timeout=_AIDER_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        timed_out = True
+        proc.kill()
+        logger.warning(f"[job {job.id}] aider wall-clock timeout — killed {model_str}")
+
     await proc.wait()
 
-    return "\n".join(lines), proc.returncode
+    if timed_out:
+        lines.append("[aider timed out — provider did not respond]")
+
+    return "\n".join(lines), proc.returncode if not timed_out else 1
 
 
 async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
@@ -139,6 +204,10 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
         if rc == 0:
             return output, True
 
+        err_msg = _extract_error(output)
+        await status_cb(f"❌ <i>{esc(err_msg)}</i>")
+        logger.warning(f"[job {job.id}] aider failed ({model_key}): {err_msg}")
+
         # Detect credit exhaustion → switch to non-Anthropic fallback
         if _is_credit_error(output) and MODELS.get(model_key, {}).get("provider") == "anthropic":
             fallback = CREDIT_FALLBACK
@@ -152,17 +221,19 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
             model_key  = fallback
             continue
 
-        # Any other non-zero exit → try FALLBACK_MODELS chain
-        fallback = FALLBACK_MODELS.get(model_key)
-        if fallback and fallback not in tried:
-            await status_cb(
-                f"⚠️ <i>{esc(MODELS[model_key]['label'])} failed — retrying with "
-                f"{esc(MODELS[fallback]['label'])}.</i>"
+        # Provider server error (500, bad gateway, no endpoints) → fallback
+        if _is_provider_error(output):
+            fallback = FALLBACK_MODELS.get(model_key) or (
+                CREDIT_FALLBACK if model_key != CREDIT_FALLBACK else None
             )
-            log_event(job.id, "model_fallback", f"{model_key} → {fallback}: rc={rc}")
-            update_job(job.id, model=fallback)
-            job.model = fallback
-            model_key  = fallback
-            continue
+            if fallback and fallback not in tried:
+                await status_cb(
+                    f"🔄 <i>Switching to {esc(MODELS[fallback]['label'])}…</i>"
+                )
+                log_event(job.id, "model_fallback", f"{model_key} → {fallback}: {err_msg}")
+                update_job(job.id, model=fallback)
+                job.model = fallback
+                model_key  = fallback
+                continue
 
-        raise RuntimeError(f"aider exited {rc}:\n{output[-600:]}")
+        raise RuntimeError(f"aider exited {rc}: {err_msg}")
