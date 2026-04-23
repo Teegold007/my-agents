@@ -212,7 +212,14 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
         output, rc, killed_by = await _run_aider_once(model_str, job, status_cb)
         log_event(job.id, "aider_done", f"rc={rc} killed_by={killed_by} model={model_key}")
 
-        if rc == 0:
+        # aider exits 0 even on credit/provider errors — check output regardless of rc
+        if rc == 0 and not _is_credit_error(output) and not _is_provider_error(output):
+            return output, True
+        if rc == 0 and _is_credit_error(output):
+            killed_by = "credit exhausted"
+        if rc == 0 and _is_provider_error(output):
+            killed_by = killed_by or "provider error"
+        if rc == 0 and not killed_by:
             return output, True
 
         err_msg = _extract_error(output)
