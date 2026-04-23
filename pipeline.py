@@ -83,7 +83,11 @@ def _inject_plan_steps(job: Job) -> Job:
         enriched = (
             f"Task: {job.task}\n\n"
             f"Execute these steps IN ORDER using the bash tool. "
-            f"Run each as a separate command — do NOT describe, actually run them:\n\n"
+            f"Run each as a separate command — do NOT describe, actually run them.\n\n"
+            f"IMPORTANT CONSTRAINTS:\n"
+            f"- Shell operators are FORBIDDEN: no $var, no $(cmd), no pipes |, no semicolons ;, no loops\n"
+            f"- If a step says 'for each file', first run the discovery command, read its output, "
+            f"then issue ONE separate bash tool call per file\n\n"
             f"{numbered}\n\n"
             f"After all steps complete, summarise what changed."
         )
