@@ -34,37 +34,67 @@ JSON format:
 }"""
 
 
+import logging
+logger = logging.getLogger(__name__)
+
+# Ordered preference for planning — most capable first, free fallback last.
+_PLAN_MODEL_CHAIN = [
+    ("anthropic", "claude-haiku-4-5-20251001"),
+    ("openrouter", "deepseek/deepseek-chat"),
+    ("groq",       "llama-3.3-70b-versatile"),
+]
+
+
+async def _call_plan_model(provider: str, model_id: str, prompt: str) -> dict:
+    if provider == "anthropic":
+        client = get_anthropic_client()
+        resp   = await client.messages.create(
+            model=model_id, max_tokens=2048,
+            system=PLAN_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = resp.content[0].text.strip()
+    else:
+        client = get_openai_client(provider)
+        resp   = await client.chat.completions.create(
+            model=model_id, max_tokens=2048,
+            messages=[
+                {"role": "system", "content": PLAN_SYSTEM},
+                {"role": "user",   "content": prompt},
+            ],
+        )
+        raw = resp.choices[0].message.content.strip()
+
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$",          "", raw)
+    return json.loads(raw)
+
+
 async def generate_plan(task: str, repo: str, model_id: str, provider: str,
-                        feedback: str = "") -> dict:
+                        feedback: str = "", previous_plan: dict = None) -> dict:
     prompt = f"Repo: {repo or 'unknown'}\nTask: {task}"
-    if feedback:
+    if previous_plan and feedback:
+        prev_steps = "\n".join(f"- {s}" for s in previous_plan.get("steps", []))
+        prompt += (
+            f"\n\nPrevious plan:\n{prev_steps}"
+            f"\n\nUser feedback — revise the plan to address this:\n{feedback}"
+        )
+    elif feedback:
         prompt += f"\n\nFeedback on previous plan — revise to address this:\n{feedback}"
-    try:
-        if provider == "anthropic":
-            client = get_anthropic_client()
-            resp   = await client.messages.create(
-                model=model_id, max_tokens=2048,
-                system=PLAN_SYSTEM,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = resp.content[0].text.strip()
-        else:
-            client = get_openai_client(provider)
-            resp   = await client.chat.completions.create(
-                model=model_id, max_tokens=2048,
-                messages=[
-                    {"role": "system", "content": PLAN_SYSTEM},
-                    {"role": "user",   "content": prompt},
-                ],
-            )
-            raw = resp.choices[0].message.content.strip()
 
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$",          "", raw)
-        return json.loads(raw)
+    # Try the requested model first, then fall back down the chain.
+    chain = [(provider, model_id)] + [
+        (p, m) for p, m in _PLAN_MODEL_CHAIN if m != model_id
+    ]
+    last_error = None
+    for p, m in chain:
+        try:
+            return await _call_plan_model(p, m, prompt)
+        except Exception as e:
+            logger.warning(f"Plan model {m} failed: {e}")
+            last_error = e
 
-    except Exception as e:
-        return {"summary": task, "steps": ["Complete the task"], "error": str(e)}
+    raise RuntimeError(f"All plan models failed. Last error: {last_error}")
 
 
 def format_plan_html(plan: dict, job_id: int) -> str:

@@ -222,13 +222,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     # ── Plan feedback — revise instead of queuing a new job ──────────────────
     if active and active.status == State.AWAITING_PLAN_APPROVAL:
-        cfg = MODELS[active.model]
+        cfg          = MODELS[active.model]
+        previous_plan = json.loads(active.plan) if active.plan else None
         await update.message.reply_html("🔄 Revising plan…")
-        plan = await generate_plan(
-            active.task, active.repo or "?",
-            cfg["id"], cfg["provider"],
-            feedback=text,
-        )
+        try:
+            plan = await generate_plan(
+                active.task, active.repo or "?",
+                cfg["id"], cfg["provider"],
+                feedback=text,
+                previous_plan=previous_plan,
+            )
+        except Exception as e:
+            await update.message.reply_html(f"❌ Could not revise plan: <code>{esc(str(e))}</code>")
+            return
         plan_json = json.dumps(plan)
         update_job(active.id, plan=plan_json)
         log_event(active.id, "plan_revised", text[:120])
