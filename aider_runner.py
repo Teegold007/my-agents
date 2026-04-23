@@ -32,8 +32,9 @@ AIDER_MODEL_MAP: dict[str, str] = {
     "r1":       "openrouter/deepseek/deepseek-r1",
 }
 
-# Fallback when Anthropic credits run out — must support tools via aider
-CREDIT_FALLBACK = "deepseek"
+# Ordered preference for non-Anthropic models when credits run out.
+# First untried model in this list is used.
+_CREDIT_FALLBACK_ORDER = ("deepseek", "llama", "qwen")
 
 # Lines that are pure decoration — skip to avoid spamming the user.
 _NOISE_PREFIXES = ("─", "━", "Aider v", "Model:", "Git repo:", "Repo-map:")
@@ -236,18 +237,23 @@ async def run_aider(job: Job, status_cb) -> tuple[str, bool]:
         await status_cb(f"❌ <i>{esc(err_msg)}</i>")
         logger.warning(f"[job {job.id}] aider failed ({model_key}): {err_msg}")
 
-        # Credit exhaustion — always escape to non-Anthropic model
+        # Credit exhaustion — pick the first untried non-Anthropic model
         if killed_by == "credit exhausted":
-            fallback = CREDIT_FALLBACK
-            await status_cb(
-                f"💳 <i>Anthropic credits exhausted — switching to "
-                f"{esc(MODELS[fallback]['label'])}.</i>"
+            fallback = next(
+                (m for m in _CREDIT_FALLBACK_ORDER if m not in tried),
+                None,
             )
-            log_event(job.id, "model_fallback", f"{model_key} → {fallback}: credit exhausted")
-            update_job(job.id, model=fallback)
-            job.model = fallback
-            model_key  = fallback
-            continue
+            if fallback:
+                await status_cb(
+                    f"💳 <i>Anthropic credits exhausted — switching to "
+                    f"{esc(MODELS[fallback]['label'])}.</i>"
+                )
+                log_event(job.id, "model_fallback", f"{model_key} → {fallback}: credit exhausted")
+                update_job(job.id, model=fallback)
+                job.model = fallback
+                model_key  = fallback
+                continue
+            raise RuntimeError("Anthropic credits exhausted and all non-Anthropic fallbacks already tried.")
 
         # Provider error or timeout — follow fallback chain
         fallback = FALLBACK_MODELS.get(model_key) or (
